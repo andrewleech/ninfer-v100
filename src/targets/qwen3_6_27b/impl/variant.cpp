@@ -306,6 +306,16 @@ void Variant::post_mixer(const Tensor& hidden, const PostMixerWeights& weights, 
                     stream);
 }
 
+void Variant::post_mixer_shard(const Tensor& hidden, const Weight& gate_up_shard,
+                               const Weight& down_shard, Tensor& partial, WorkspaceArena& workspace,
+                               cudaStream_t stream) {
+    auto scope                            = workspace.scope();
+    const std::int32_t shard_intermediate = gate_up_shard.n / 2;
+    Tensor activation = workspace.alloc(DType::BF16, {shard_intermediate, hidden.ne[1]});
+    ops::linear_swiglu_graph_shard(hidden, gate_up_shard, activation, workspace, stream);
+    ops::linear_partial(activation, down_shard, partial, workspace, stream);
+}
+
 void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                              Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope     = workspace.scope();
@@ -499,6 +509,25 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     }
     }
     throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
+}
+
+std::size_t Variant::post_mixer_shard_workspace_capacity_bytes(std::int32_t shard_intermediate,
+                                                               std::int32_t first,
+                                                               std::int32_t last) {
+    validate_token_interval(first, last);
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {shard_intermediate, last});
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(ops::linear_swiglu_graph_shard_workspace_bytes(
+            2 * shard_intermediate, TextConfig::hidden, first, last));
+    }
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(ops::linear_partial_workspace_bytes(
+            TextConfig::hidden, shard_intermediate, first, last));
+    }
+    return layout.peak_bytes(1);
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,

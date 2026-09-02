@@ -37,6 +37,13 @@ struct Variant {
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
+    // Dual-device (NVLink graph-parallel) capability. The MLP is sharded across both cards on every
+    // text layer; the 16 full-attention layers' KV splits with the primary owning the first
+    // graph_primary_attention_layers and the secondary the rest. Non-graph targets set these to
+    // {false, 0}. See docs/DUAL-V100-PORT-PLAN.md.
+    static constexpr bool supports_graph_parallel               = true;
+    static constexpr std::size_t graph_primary_attention_layers = 5;
+
     static void attention_projection(const Tensor& hidden,
                                      const FullAttentionProjectionWeights& weights, Tensor& query,
                                      Tensor& gate, Tensor& key, Tensor& value,
@@ -80,6 +87,14 @@ struct Variant {
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);
+    // One card's contribution to the dual-device MLP down projection: a plain (non-residual)
+    // partial = down_shard @ SwiGLU(gate_up_shard @ hidden). The caller (executor) has already
+    // activated this rank's device and passes its stream + per-rank workspace; the two cards'
+    // partials are peer-reduced with the residual by ops::residual_add_two. gate_up_shard is
+    // [2*M,hidden], down_shard is [hidden,M], partial is [hidden,T].
+    static void post_mixer_shard(const Tensor& hidden, const Weight& gate_up_shard,
+                                 const Weight& down_shard, Tensor& partial,
+                                 WorkspaceArena& workspace, cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
     [[nodiscard]] static std::size_t
@@ -115,6 +130,9 @@ struct Variant {
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
                                         std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t
+    post_mixer_shard_workspace_capacity_bytes(std::int32_t shard_intermediate, std::int32_t first,
+                                              std::int32_t last);
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                                              std::int32_t last);
 
