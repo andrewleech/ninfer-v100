@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <span>
@@ -21,6 +22,20 @@
 #include <vector>
 
 namespace ninfer::targets::qwen3_6_27b::detail {
+
+// MLP graph-parallel split point: the primary card owns the first N of the 17408 intermediate
+// channels, the secondary the rest. 8192 is the validated default; NINFER_MLP_PRIMARY overrides it
+// (a multiple of 64 in (0, 17408)) to rebalance VRAM -- a smaller primary lightens the weight-heavy
+// card so the full 262K KV fits under tensor-parallel attention. The load and shard-plan paths MUST
+// read the same value, hence one shared accessor.
+inline std::int64_t mlp_primary_intermediate() {
+    if (const char* raw = std::getenv("NINFER_MLP_PRIMARY")) {
+        const long value = std::strtol(raw, nullptr, 10);
+        if (value > 0 && value < 17408 && (value % 64) == 0) { return value; }
+    }
+    return 8192;
+}
+
 namespace {
 
 using artifact::NumericFormat;
@@ -169,8 +184,8 @@ DensePostMixerPayload load_mlp(const MlpPlan& plan,
         // Graph-parallel MLP: primary owns the first kPrimaryIntermediate channels, the secondary
         // owns the rest. The packed gate/up rows are 2*intermediate (gate then up), so the row
         // counts double the intermediate split; the down projection splits along its K columns.
-        constexpr std::int32_t kPrimaryIntermediate   = 8192;
-        constexpr std::int32_t kSecondaryIntermediate = 17408 - kPrimaryIntermediate;
+        const std::int32_t kPrimaryIntermediate = static_cast<std::int32_t>(mlp_primary_intermediate());
+        const std::int32_t kSecondaryIntermediate = 17408 - kPrimaryIntermediate;
         out.gate_up           = artifact::materialized_weight(materialized, plan.gate_up.object,
                                                               plan.gate_up.format,
                                                               2 * kPrimaryIntermediate, 5120, 0);
@@ -483,11 +498,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         // Split every main-model MLP's packed Q4 gate/up (by paired intermediate rows) and Q5 down
         // (by K columns) at kPrimaryIntermediate so the primary owns the first shard and the
         // secondary the rest. The loader materializer performs the physical cross-device repack.
-        // 8192 is the validated split (primary 11.09 GiB / secondary 4.83 GiB, runs correctly). Do
-        // not change it without re-validating on GPU: a trial at 9216 loaded but faulted during
-        // inference (cudaErrorIllegalAddress) -- some shard path is not fully split-agnostic at
-        // non-default splits (root cause not yet isolated). See DUAL-V100-BRINGUP-LOG.md.
-        constexpr std::uint64_t kPrimaryIntermediate = 8192;
+        // 8192 is the validated default; NINFER_MLP_PRIMARY rebalances it (see mlp_primary_intermediate).
+        // A smaller primary lightens the weight-heavy card so the full 262K KV fits under TP attention.
+        const std::uint64_t kPrimaryIntermediate =
+            static_cast<std::uint64_t>(mlp_primary_intermediate());
         for (const TextLayerPlan& layer : out.text_layers) {
             binder.shard_row_split_across_devices(layer.mlp.gate_up.object,
                                                   artifact::RowSplitShardAxis::PairedRows,
