@@ -152,9 +152,9 @@ class VisionPrefillSession;
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
-                qwen3_6::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
-                std::uint32_t text_kv_base,
+                WorkspaceArena* secondary_work, qwen3_6::PagedKVCacheView kv,
+                LinearAttentionStatePool& state, qwen3_6::RoundState& io, Tensor& prefill_hidden,
+                std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr);
@@ -244,6 +244,18 @@ private:
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
+    // Dual-device (NVLink graph-parallel) MLP: the primary computes its row shard while the
+    // secondary peer-copies the normalized hidden, computes its shard, and copies the partial back;
+    // the two partials are reduced into the residual on the primary stream. Only instantiated for
+    // graph-parallel targets (guarded by if constexpr in mlp_tail), so payload.secondary_* is never
+    // referenced for non-graph payloads. See docs/DUAL-V100-PORT-PLAN.md.
+    [[nodiscard]] bool graph_parallel_active() const noexcept;
+    // Templated on the variant V (defaulting to Variant) as well as the payload so that both
+    // V::post_mixer_shard and payload.secondary_* are dependent names: two-phase lookup then defers
+    // them to instantiation, which the if constexpr in mlp_tail only triggers for graph targets.
+    template <class Payload, class V = Variant>
+    void post_mixer_graph(const Tensor& hidden, const Payload& payload, Tensor& residual,
+                          int tokens);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
@@ -290,6 +302,7 @@ private:
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;
+    WorkspaceArena* secondary_work_ = nullptr;
     qwen3_6::PagedKVCacheView kv_;
     qwen3_6::PagedKVCacheView mtp_kv_;
     const qwen3_6::PagedKVCache* batch_text_kv_ = nullptr;

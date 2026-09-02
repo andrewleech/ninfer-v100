@@ -218,13 +218,14 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_
 }
 
 TextContext::TextContext(DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
-                         qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state,
-                         qwen3_6::RoundState& io, Tensor& prefill_hidden,
-                         std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
-                         qwen3_6::PagedKVCacheView mtp_kv,
+                         WorkspaceArena* secondary_work, qwen3_6::PagedKVCacheView kv,
+                         LinearAttentionStatePool& state, qwen3_6::RoundState& io,
+                         Tensor& prefill_hidden, std::uint32_t prefill_chunk,
+                         std::uint32_t text_kv_base, qwen3_6::PagedKVCacheView mtp_kv,
                          const qwen3_6::PagedKVCache* batch_text_kv,
                          const qwen3_6::PagedKVCache* batch_mtp_kv)
-    : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
+    : ctx_(ctx), weights_(weights), work_(work), secondary_work_(secondary_work), kv_(kv),
+      mtp_kv_(mtp_kv), state_(state), io_(io),
       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
       batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv) {
     if (prefill_chunk_ == 0 ||
@@ -990,7 +991,63 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
     Tensor h       = workspace_recipe::post_mixer_hidden<TextConfig>(work_, T);
     ops::rmsnorm(x, *post_norm, kCfg.rms_eps, true, h, s);
 
+    if constexpr (Variant::supports_graph_parallel) {
+        if (graph_parallel_active()) {
+            post_mixer_graph(h, *m.payload, x, T);
+            return;
+        }
+    }
     Variant::post_mixer(h, *m.payload, x, ph, work_, s);
+}
+
+bool TextContext::graph_parallel_active() const noexcept {
+    return ctx_.model_parallel() && secondary_work_ != nullptr;
+}
+
+template <class Payload, class V>
+void TextContext::post_mixer_graph(const Tensor& hidden, const Payload& payload, Tensor& residual,
+                                   int tokens) {
+    const std::int32_t hidden_dim   = kCfg.hidden;
+    cudaStream_t primary_stream     = ctx_.stream_for_rank(0);
+    cudaEvent_t primary_ready       = ctx_.fence_for_rank(0);
+    cudaEvent_t secondary_ready     = ctx_.fence_for_rank(1);
+    const int primary_device        = ctx_.device_ids()[0];
+    const int secondary_device      = ctx_.device_ids()[1];
+
+    // Both partials and the peer landing buffer live in the primary arena (already inside the
+    // caller's mlp scope). residual holds the post-attention residual and is updated in place.
+    Tensor primary_partial = work_.alloc(DType::BF16, {hidden_dim, tokens});
+    Tensor peer_partial    = work_.alloc(DType::BF16, {hidden_dim, tokens});
+
+    // Publish that the normalized hidden is ready, then launch the primary shard so it overlaps the
+    // secondary's copy + compute on the other card.
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    V::post_mixer_shard(hidden, payload.gate_up, payload.down, primary_partial, work_,
+                        primary_stream);
+
+    // Keep the secondary arena scope open across the copy-back below so secondary_partial's storage
+    // stays reserved until the reduce has read it (no reliance on a cross-layer fence chain).
+    auto secondary_scope = secondary_work_->scope();
+    Tensor secondary_partial;
+    {
+        ScopedDeviceRank secondary(ctx_, 1);
+        cudaStream_t secondary_stream = ctx_.stream_for_rank(1);
+        Tensor secondary_hidden       = secondary_work_->alloc(DType::BF16, {hidden_dim, tokens});
+        secondary_partial             = secondary_work_->alloc(DType::BF16, {hidden_dim, tokens});
+        CUDA_CHECK(cudaStreamWaitEvent(secondary_stream, primary_ready, 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(secondary_hidden.data, secondary_device, hidden.data,
+                                       primary_device, hidden.bytes(), secondary_stream));
+        V::post_mixer_shard(secondary_hidden, payload.secondary_gate_up, payload.secondary_down,
+                            secondary_partial, *secondary_work_, secondary_stream);
+        CUDA_CHECK(cudaEventRecord(secondary_ready, secondary_stream));
+    }
+    // Back on the primary: wait for the secondary shard, pull its partial over NVLink, and reduce
+    // both partials into the residual. All three enqueue on the primary stream, so end-of-step sync
+    // of the primary stream alone gates the next layer.
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+    CUDA_CHECK(cudaMemcpyPeerAsync(peer_partial.data, primary_device, secondary_partial.data,
+                                   secondary_device, peer_partial.bytes(), primary_stream));
+    ops::residual_add_two(primary_partial, peer_partial, residual, primary_stream);
 }
 
 template <class Tap>

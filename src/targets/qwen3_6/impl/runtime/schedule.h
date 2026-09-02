@@ -38,6 +38,10 @@ struct ExecutionCore {
     Tensor& prefill_hidden;
     std::uint32_t prefill_chunk;
     ProposalHead proposal_head;
+    // Non-null only in NVLink graph-parallel mode: the rank-1 workspace arena backing the secondary
+    // card's MLP shard (and, in later phases, its remote-attention scratch). Trailing + defaulted so
+    // existing positional aggregate initializers stay valid. See docs/DUAL-V100-PORT-PLAN.md.
+    WorkspaceArena* secondary_work = nullptr;
 };
 
 struct PrefillContext {

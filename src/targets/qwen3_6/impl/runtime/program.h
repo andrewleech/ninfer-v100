@@ -640,6 +640,11 @@ public:
     DeviceArena persistent;
     DeviceArena workspace_storage;
     WorkspaceArena work;
+    // NVLink graph-parallel: the secondary card's workspace arena, allocated on rank 1. Present only
+    // when device.model_parallel(); backs the secondary MLP shard (post_mixer_graph). Phase 5D sizes
+    // its reservation precisely; here it mirrors the primary general workspace capacity.
+    std::optional<DeviceArena> secondary_workspace_storage;
+    std::optional<WorkspaceArena> secondary_work;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;

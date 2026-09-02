@@ -778,6 +778,15 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
          workspace_plan.vision->general_capacity_bytes != workspace_plan.general_capacity)) {
         throw std::invalid_argument("Qwen3.6 workspace plan does not match startup features");
     }
+    if (device.model_parallel()) {
+        // Allocate the secondary card's workspace on rank 1 so the MLP shard's scratch lives in that
+        // card's VRAM. Mirrors the primary general workspace capacity (a safe upper bound for the
+        // shard's transients); Phase 5D tightens the reservation accounting.
+        ScopedDeviceRank secondary(device, 1);
+        secondary_workspace_storage.emplace(workspace_plan.capacity);
+        secondary_work.emplace(
+            DeviceSpan{secondary_workspace_storage->base(), workspace_plan.general_capacity});
+    }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     if (!plan.context_cache.max_private_continuations || !plan.context_cache.max_shared_prefixes) {
         throw std::logic_error("Qwen3.6 context cache options are not normalized");
@@ -967,6 +976,14 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 ProgramImplCore::~ProgramImplCore() noexcept {
     if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
     if (device.stream != nullptr) { (void)cudaStreamSynchronize(device.stream); }
+    if (device.model_parallel()) {
+        // Drain and free the secondary card's workspace on its own rank, mirroring construction so
+        // the DeviceArena's cudaFree runs with rank 1 active.
+        device.synchronize_rank(1);
+        ScopedDeviceRank secondary(device, 1);
+        secondary_work.reset();
+        secondary_workspace_storage.reset();
+    }
 }
 
 std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
@@ -10330,7 +10347,8 @@ void ProgramImplCore::prepare_graphs() {
                                        io,
                                        prefill_hidden,
                                        prefill_chunk,
-                                       proposal_head};
+                                       proposal_head,
+                                       secondary_work ? &*secondary_work : nullptr};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {

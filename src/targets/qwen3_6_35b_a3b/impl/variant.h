@@ -35,6 +35,12 @@ struct Variant {
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
+    // Dual-device (NVLink graph-parallel) capability. The 35B-A3B MoE is not a graph-parallel
+    // target: its expert-offload shape does not match the dense MLP row/column split, so it stays
+    // single-card. Non-graph targets set these to {false, 0}. See docs/DUAL-V100-PORT-PLAN.md.
+    static constexpr bool supports_graph_parallel               = false;
+    static constexpr std::size_t graph_primary_attention_layers = 0;
+
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);
     [[nodiscard]] static std::vector<GraphExecutionProfile>
