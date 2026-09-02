@@ -3,6 +3,7 @@
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_kernels.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/w8/w8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -240,6 +241,30 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
 std::size_t q4_q5_attn_input_proj_workspace_capacity_bytes(std::int32_t min_tokens,
                                                             std::int32_t max_tokens) {
     return detail::q4_q5_attn_input_capacity_workspace_bytes(min_tokens, max_tokens);
+}
+
+void attn_input_proj_graph_shard(const Tensor& x, const Weight& query_key_shard,
+                                 const Weight& gate_value_shard, Tensor& qk_out, Tensor& gv_out,
+                                 WorkspaceArena& workspace, cudaStream_t stream) {
+    constexpr std::int32_t kHidden = 5120;
+    const std::int32_t cols        = x.ne[1];
+    const std::int32_t qk_rows     = qk_out.ne[0];
+    const std::int32_t gv_rows     = gv_out.ne[0];
+    require_matrix(x, kHidden, cols, "x");
+    require_matrix(qk_out, qk_rows, cols, "qk_out");
+    require_matrix(gv_out, gv_rows, cols, "gv_out");
+    require_rowsplit(query_key_shard, QType::Q4G64_F16S, qk_rows, "query/key shard");
+    require_rowsplit(gate_value_shard, QType::Q5G64_F16S, gv_rows, "gate/value shard");
+    detail::attn_input_proj_graph_shard_launch(x, query_key_shard, gate_value_shard, qk_out, gv_out,
+                                               workspace, stream);
+}
+
+std::size_t attn_input_proj_graph_shard_workspace_capacity_bytes(std::int32_t qk_rows,
+                                                                 std::int32_t gv_rows,
+                                                                 std::int32_t min_tokens,
+                                                                 std::int32_t max_tokens) {
+    return detail::attn_input_proj_graph_shard_workspace_bytes(qk_rows, gv_rows, 5120, min_tokens,
+                                                               max_tokens);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,

@@ -44,6 +44,19 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
 q4_q5_attn_input_proj_workspace_capacity_bytes(std::int32_t min_tokens, std::int32_t max_tokens);
 
 /**
+ * NVLink tensor-parallel attention projection for one card's head shard. query_key_shard is this
+ * card's Q4 row band (q rows | k rows) of the [7168,5120] parent; gate_value_shard the Q5 band
+ * (gate rows | v rows). Produces qk_out = query_key_shard @ x and gv_out = gate_value_shard @ x; the
+ * caller slices q/k from qk_out and gate/v from gv_out. Volta-only. See DUAL-V100-PORT-PLAN.md.
+ */
+void attn_input_proj_graph_shard(const Tensor& x, const Weight& query_key_shard,
+                                 const Weight& gate_value_shard, Tensor& qk_out, Tensor& gv_out,
+                                 WorkspaceArena& workspace, cudaStream_t stream);
+
+[[nodiscard]] std::size_t attn_input_proj_graph_shard_workspace_capacity_bytes(
+    std::int32_t qk_rows, std::int32_t gv_rows, std::int32_t min_tokens, std::int32_t max_tokens);
+
+/**
  * Computes the single-parent Q/K/output-gate/V projection.
  *
  * The parent stores rows in physical order query, key, output gate, value while the public output
