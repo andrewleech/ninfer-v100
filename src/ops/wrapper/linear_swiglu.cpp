@@ -4,6 +4,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
+#include "ops/linear_swiglu/q4/q4_linear_swiglu_kernels.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_plan.h"
 
@@ -143,6 +144,51 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream) {
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, stream);
+}
+
+std::size_t linear_swiglu_graph_shard_workspace_bytes(std::int32_t gate_up_rows,
+                                                      std::int32_t input_rows,
+                                                      std::int32_t min_tokens,
+                                                      std::int32_t max_tokens) {
+    return detail::q4_linear_swiglu_graph_shard_workspace_bytes(gate_up_rows, input_rows, min_tokens,
+                                                                max_tokens);
+}
+
+void linear_swiglu_graph_shard(const Tensor& x, const Weight& gate_up_shard, Tensor& out,
+                               WorkspaceArena& ws, cudaStream_t stream) {
+    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
+        throw std::invalid_argument("linear_swiglu_graph_shard: x/out must be BF16");
+    }
+    const std::int32_t t           = x.ne[1];
+    const std::int32_t output_rows = out.ne[0];
+    if (t <= 0 || x.ne[2] != 1 || x.ne[3] != 1 || out.ne[1] != t || out.ne[2] != 1 ||
+        out.ne[3] != 1 || output_rows <= 0) {
+        throw std::invalid_argument("linear_swiglu_graph_shard: invalid tensor shape");
+    }
+    if (gate_up_shard.n != 2 * output_rows || gate_up_shard.k != x.ne[0]) {
+        throw std::invalid_argument("linear_swiglu_graph_shard: gate_up shard must be [2*out,K]");
+    }
+    if (!x.is_contiguous() || !out.is_contiguous()) {
+        throw std::invalid_argument("linear_swiglu_graph_shard: x/out must be contiguous");
+    }
+    if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16)) {
+        throw std::invalid_argument(
+            "linear_swiglu_graph_shard: x/out must be non-null and 16-byte aligned");
+    }
+    const bool q4_row_split =
+        gate_up_shard.qtype == QType::Q4G64_F16S && gate_up_shard.layout == QuantLayout::RowSplit &&
+        gate_up_shard.scale_dtype == DType::FP16 && gate_up_shard.group_size == 64 &&
+        gate_up_shard.group == 64 && gate_up_shard.ndim == 2 &&
+        gate_up_shard.shape[0] == gate_up_shard.n && gate_up_shard.shape[1] == gate_up_shard.k &&
+        gate_up_shard.qdata != nullptr && gate_up_shard.scales != nullptr;
+    if (!q4_row_split) {
+        throw std::invalid_argument("linear_swiglu_graph_shard: unsupported weight");
+    }
+    if (!aligned_to(gate_up_shard.qdata, 16) || !aligned_to(gate_up_shard.scales, 4)) {
+        throw std::invalid_argument(
+            "linear_swiglu_graph_shard: required code/scale alignment is missing");
+    }
+    detail::q4_linear_swiglu_graph_shard_launch(x, gate_up_shard, out, ws, stream);
 }
 
 } // namespace ninfer::ops

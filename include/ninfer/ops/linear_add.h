@@ -72,4 +72,28 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, WorkspaceAre
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 WorkspaceArena& ws, cudaStream_t stream);
 
+/**
+ * Transient capacity for linear_partial over every T in [min_tokens,max_tokens]. Volta-only.
+ */
+[[nodiscard]] std::size_t linear_partial_workspace_bytes(std::int32_t output_rows,
+                                                         std::int32_t input_rows,
+                                                         std::int32_t min_tokens,
+                                                         std::int32_t max_tokens);
+
+/**
+ * Op: linear_partial (dual-device MLP down projection for one card's column shard)
+ *
+ * Math / indexing:
+ *   out[:,t] = Linear(x, w)[:,t]   (plain projection, NO residual add).
+ *
+ * The split-K counterpart to linear_add: each card computes a non-residual partial over its slice
+ * of the 17408 intermediate (k=8192 primary / 9216 secondary), and the two partials are summed with
+ * the residual by residual_add_two. Admits any Q5G64_F16S RowSplit weight `[N,K]` whose K is a whole
+ * number of Q5 groups (the single-card linear_add restricts to K in {6144,17408}). Runtime-shaped
+ * Volta tensor-core route, so Volta-only. Contiguous BF16 x `[K,T]` and out `[N,T]`; x/weight and
+ * out must not alias. Caller-owned transient storage reported by linear_partial_workspace_bytes().
+ */
+void linear_partial(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                    cudaStream_t stream);
+
 } // namespace ninfer::ops

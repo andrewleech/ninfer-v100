@@ -49,4 +49,24 @@ void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
     detail::residual_add_launch(y, x, stream); // single variant -> direct dispatch
 }
 
+void residual_add_two(const Tensor& a, const Tensor& b, Tensor& x, cudaStream_t stream) {
+    if (a.dtype != DType::BF16 || b.dtype != DType::BF16 || x.dtype != DType::BF16) {
+        throw std::invalid_argument("residual_add_two: a/b/x must be BF16");
+    }
+    for (int d = 0; d < 4; ++d) {
+        if (a.ne[d] != x.ne[d] || b.ne[d] != x.ne[d]) {
+            throw std::invalid_argument("residual_add_two: a/b/x shapes must match");
+        }
+    }
+    if (numel_allow_zero(x) == 0) { return; }
+    if (!a.is_contiguous() || !b.is_contiguous() || !x.is_contiguous()) {
+        throw std::invalid_argument("residual_add_two: a/b/x must be contiguous");
+    }
+    if (a.data == nullptr || b.data == nullptr || x.data == nullptr) {
+        throw std::invalid_argument("residual_add_two: a/b/x data must be non-null");
+    }
+
+    detail::residual_add_two_launch(a, b, x, stream); // single variant -> direct dispatch
+}
+
 } // namespace ninfer::ops

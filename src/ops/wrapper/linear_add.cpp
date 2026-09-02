@@ -7,6 +7,7 @@
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
+#include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_add/w8/w8_linear_add_plan.h"
 
@@ -240,6 +241,34 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     }
 
     throw std::invalid_argument("linear_add: unsupported weight format");
+}
+
+std::size_t linear_partial_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
+                                           std::int32_t min_tokens, std::int32_t max_tokens) {
+    return detail::q5_linear_graph_partial_workspace_bytes(output_rows, input_rows, min_tokens,
+                                                           max_tokens);
+}
+
+void linear_partial(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                    cudaStream_t stream) {
+    const std::int32_t t = x.ne[1];
+    if (t <= 0) { throw std::invalid_argument("linear_partial: T must be positive"); }
+    require_tensor(x, DType::BF16, w.k, t, "x");
+    require_tensor(out, DType::BF16, w.n, t, "out");
+    if (overlaps(x, out)) {
+        throw std::invalid_argument("linear_partial: x and out must not overlap");
+    }
+    require_q5(w);
+    // launch_q5_volta_mma needs whole Q5 groups per split and 16-byte activation staging.
+    if ((w.k % 64) != 0 || (w.k % 8) != 0) {
+        throw std::invalid_argument("linear_partial: Q5 shard k must be a whole number of groups");
+    }
+    if (!aligned_to(x.data, 16) || !aligned_to(out.data, 16) || !aligned_to(w.qdata, 16) ||
+        !aligned_to(w.qhigh, 16) || !aligned_to(w.scales, 16)) {
+        throw std::invalid_argument(
+            "linear_partial: Q5 requires 16-byte x/out/code/high/scale alignment");
+    }
+    detail::q5_linear_graph_partial_launch(x, w, out, ws, stream);
 }
 
 } // namespace ninfer::ops

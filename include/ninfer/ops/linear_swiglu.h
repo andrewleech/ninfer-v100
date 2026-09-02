@@ -81,4 +81,30 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, WorkspaceArena& ws,
                    cudaStream_t stream);
 
+/**
+ * Transient capacity for linear_swiglu_graph_shard over every T in [min_tokens,max_tokens].
+ * `gate_up_rows` is the compact shard's packed row count (2 * shard intermediate). Volta-only.
+ */
+[[nodiscard]] std::size_t linear_swiglu_graph_shard_workspace_bytes(std::int32_t gate_up_rows,
+                                                                    std::int32_t input_rows,
+                                                                    std::int32_t min_tokens,
+                                                                    std::int32_t max_tokens);
+
+/**
+ * Op: linear_swiglu_graph_shard (dual-device MLP gate/up for one card's row shard)
+ *
+ * Math / indexing:
+ *   gate_up = Linear(x, gate_up_shard); M = out.ne[0] = gate_up_shard.n / 2;
+ *   out[i,t] = SiLU(gate_up[i,t]) * gate_up[M+i,t].
+ *
+ * Unlike linear_swiglu, this admits any even Q4G64_F16S RowSplit shard `[2*M,K]` (the 27B card
+ * shards are `[16384,5120]` and `[18432,5120]`) instead of the single exact `[34816,5120]`
+ * registration. It materializes gate_up through the runtime-shaped Volta tensor-core GEMM and
+ * applies SwiGLU, so it is Volta-only (A16). Inputs/output are contiguous BF16; x `[K,T]`, out
+ * `[M,T]`. Caller-owned transient storage is reported by
+ * linear_swiglu_graph_shard_workspace_bytes(); x/weight and out must not alias.
+ */
+void linear_swiglu_graph_shard(const Tensor& x, const Weight& gate_up_shard, Tensor& out,
+                               WorkspaceArena& ws, cudaStream_t stream);
+
 } // namespace ninfer::ops

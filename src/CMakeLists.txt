@@ -195,6 +195,7 @@ add_library(ninfer_ops STATIC
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu
+  ops/linear_add/q5/q5_linear_graph_partial.cu
   ops/linear_add/q5/q5_linear_add_plan.cpp
   ops/linear_add/w8/w8_linear_add_gemm_mma.cu
   ops/linear_add/w8/w8_linear_add_gemm_simt.cu
@@ -202,6 +203,7 @@ add_library(ninfer_ops STATIC
   ops/linear_add/w8/w8_linear_add_plan.cpp
   ops/linear_swiglu/q4/q4_linear_swiglu_gemm_mma.cu
   ops/linear_swiglu/q4/q4_linear_swiglu_gemv.cu
+  ops/linear_swiglu/q4/q4_linear_swiglu_graph_shard.cu
   ops/linear_swiglu/q4/q4_linear_swiglu_plan.cpp
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_decode.cu
   ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_small_t.cu
