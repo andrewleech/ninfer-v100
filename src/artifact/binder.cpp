@@ -134,6 +134,13 @@ void Binder::shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAx
         if ((rows % 2) != 0 || split == 0 || split >= rows / 2) {
             throw ArtifactError("paired-row shard split is outside the logical row range");
         }
+    } else if (axis == RowSplitShardAxis::QkvHeadHalf) {
+        // split = Q-band row count; the remaining rows are the K/V band. Each band halves by head
+        // across the two cards, so both must be even. Rows are output channels; the row-split-k128
+        // grouping runs along the columns and is unaffected by a row split, so no column-group check.
+        if (split == 0 || split >= rows || (split % 2) != 0 || ((rows - split) % 2) != 0) {
+            throw ArtifactError("qkv-head-half shard split is outside the logical row range");
+        }
     } else {
         if (split == 0 || split >= cols) {
             throw ArtifactError("column shard split is outside the logical column range");
