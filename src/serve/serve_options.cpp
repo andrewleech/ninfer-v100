@@ -22,6 +22,26 @@ int parse_nonnegative_int(const char* text, const char* label) {
     return static_cast<int>(value);
 }
 
+std::vector<int> parse_devices(const char* text) {
+    const std::string_view input(text == nullptr ? "" : text);
+    std::vector<int> devices;
+    std::size_t begin = 0;
+    while (begin <= input.size()) {
+        const std::size_t comma = input.find(',', begin);
+        const std::size_t end   = comma == std::string_view::npos ? input.size() : comma;
+        if (end == begin) { throw std::invalid_argument("invalid devices: " + std::string(input)); }
+        const std::string token(input.substr(begin, end - begin));
+        devices.push_back(parse_nonnegative_int(token.c_str(), "devices"));
+        if (devices.size() > 2) {
+            throw std::invalid_argument("--devices supports exactly one or two CUDA devices");
+        }
+        if (comma == std::string_view::npos) { break; }
+        begin = comma + 1;
+    }
+    if (devices.empty()) { throw std::invalid_argument("--devices must not be empty"); }
+    return devices;
+}
+
 float parse_float_in(const char* text, const char* label, float lo, float hi) {
     char* end          = nullptr;
     const double value = std::strtod(text, &end);
@@ -67,7 +87,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N|--devices N,M] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -128,6 +148,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool default_max_tokens_explicit = false;
     bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
+    bool device_explicit             = false;
+    bool devices_explicit            = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -256,6 +278,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
+            device_explicit = true;
+        } else if (arg == "--devices") {
+            options.devices  = parse_devices(require_value("--devices"));
+            devices_explicit = true;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
         } else if (arg == "--spec") {
@@ -315,6 +341,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
+    }
+    if (device_explicit && devices_explicit) {
+        throw std::invalid_argument("--device and --devices are mutually exclusive");
+    }
+    if (devices_explicit) {
+        options.device         = options.devices.front();
+        options.use_cuda_graph = options.devices.size() == 1 && options.use_cuda_graph;
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);

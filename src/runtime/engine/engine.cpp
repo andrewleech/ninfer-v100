@@ -19,6 +19,15 @@ namespace ninfer {
 namespace {
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    // Reconcile the scalar --device and the vector --devices routes so downstream code can rely
+    // on both being consistent. One device is the ordinary single-GPU path; two devices select
+    // graph parallelism, which cannot be captured as one single-device CUDA graph.
+    if (options.devices.empty()) {
+        options.devices = {options.device};
+    } else {
+        options.device = options.devices.front();
+        if (options.devices.size() > 1) { options.use_cuda_graph = false; }
+    }
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -214,7 +223,7 @@ public:
                               std::unique_ptr<ScoreCore27>, std::unique_ptr<ScoreCore35>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(normalize_engine_options(std::move(engine_options))), device(options.device) {
+        : options(normalize_engine_options(std::move(engine_options))), device(options.devices) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         auto constructed  = targets::construct_target(options, device);
         active            = std::move(constructed.active);

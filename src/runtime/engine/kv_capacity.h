@@ -8,6 +8,8 @@ namespace ninfer::runtime {
 
 [[nodiscard]] KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                                                        const SequenceCapacityCurve& curve,
-                                                       std::size_t available_runtime_bytes);
+                                                       std::size_t available_runtime_bytes,
+                                                       std::size_t secondary_available_runtime_bytes =
+                                                           0);
 
 } // namespace ninfer::runtime

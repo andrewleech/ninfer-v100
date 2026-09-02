@@ -108,6 +108,9 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    // One entry preserves the single-GPU route. Two entries enable graph parallelism in the
+    // listed CUDA order (primary/reduction device, secondary shard device).
+    std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
@@ -671,6 +674,7 @@ struct VisionWorkspaceMemorySummary {
 
 struct MemorySummary {
     int device                                = 0;
+    std::vector<int> devices;
     std::uint32_t max_context                 = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
@@ -678,8 +682,11 @@ struct MemorySummary {
     std::uint32_t kv_capacity_max_page_groups = 0;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
     ArenaMemorySummary weights;
+    ArenaMemorySummary secondary_weights;
     ArenaMemorySummary sequence;
+    ArenaMemorySummary secondary_sequence;
     ArenaMemorySummary workspace;
+    ArenaMemorySummary secondary_workspace;
     std::optional<VisionWorkspaceMemorySummary> vision_workspace;
     std::size_t minimum_runtime_reservation_bytes = 0;
     std::size_t kv_capacity_increment_bytes       = 0;
@@ -688,9 +695,16 @@ struct MemorySummary {
     std::size_t available_after_startup_bytes     = 0;
     std::size_t kv_capacity_headroom_bytes        = 0;
     std::size_t planned_slack_bytes               = 0;
+    std::size_t secondary_minimum_runtime_reservation_bytes = 0;
+    std::size_t secondary_kv_capacity_increment_bytes       = 0;
+    std::size_t secondary_runtime_reservation_bytes         = 0;
+    std::size_t secondary_available_after_weights_bytes     = 0;
+    std::size_t secondary_available_after_startup_bytes     = 0;
+    std::size_t secondary_planned_slack_bytes               = 0;
     std::size_t workspace_logical_peak_bytes      = 0;
     std::size_t cuda_graph_allowance_bytes        = 0;
     std::size_t kv_payload_bytes                  = 0;
+    std::size_t secondary_kv_payload_bytes        = 0;
     std::uint32_t host_state_capacity_slots       = 0;
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
@@ -843,6 +857,7 @@ struct LoadSummary {
     double upload_seconds              = 0.0;
     std::uint64_t artifact_bytes_read  = 0;
     std::uint64_t host_to_device_bytes = 0;
+    std::uint64_t peer_to_peer_bytes   = 0;
     std::uint64_t peak_staging_bytes   = 0;
     std::size_t tensor_count           = 0;
     std::size_t resource_count         = 0;
