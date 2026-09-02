@@ -129,11 +129,13 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features);
+                               qwen3_6::StartupFeatures features, bool graph_parallel = false);
 
 struct DensePostMixerPayload {
     Weight gate_up;
     Weight down;
+    Weight secondary_gate_up;
+    Weight secondary_down;
 };
 
 struct SplitAttentionProjectionPayload {

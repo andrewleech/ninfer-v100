@@ -87,7 +87,8 @@ struct ModelView {
     using MtpLayer  = MtpWeights<MtpAttentionPayload, MtpPostMixerPayload>;
     using DFlash    = DFlashPayload;
 
-    DeviceArena* weights_arena = nullptr;
+    DeviceArena* weights_arena           = nullptr;
+    DeviceArena* secondary_weights_arena = nullptr;
     Weight token_embedding;
     std::array<FullLayer, FullAttentionLayers> full_layers;
     std::array<GdnLayer, GdnLayers> gdn_layers;

@@ -103,7 +103,8 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                      WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
+        detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options),
+                              options.devices.size() == 2)));
 }
 
 std::unique_ptr<Package::LoadedModel>
