@@ -28,17 +28,20 @@ std::size_t q4_linear_swiglu_graph_shard_workspace_bytes(std::int32_t gate_up_ro
             "q4 linear_swiglu graph shard: gate_up_rows must be positive and even");
     }
 #ifdef NINFER_VOLTA_BUILD
-    (void)input_rows;
     // The launcher materializes gate_up [gate_up_rows, T] into the arena, then launch_q4_volta_mma
     // stacks its own fp32 split-K accumulator above it. The gate_up buffer is monotonic in T. The
     // accumulator is gate_up_rows*T*4 when the shape multi-splits and 0 when it resolves to a single
-    // split -- not monotonic -- so reserve its largest possible extent (gate_up_rows*max_tokens*4)
-    // rather than probing q4_volta_mma_workspace_bytes at max_tokens, which could sit at a
-    // single-split 0 while an interior T multi-splits.
+    // split. Splits is non-increasing in T, so if the largest-split end (min_tokens) already
+    // resolves to a single split -- which every 27B shard does, gate_up_rows>=16384 puts row_ctas
+    // over the CTA budget at all T -- the accumulator is never allocated; otherwise reserve its
+    // largest possible extent (gate_up_rows*max_tokens*4), which dominates gate_up_rows*T*4 for
+    // every T<=max_tokens.
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens});
-    (void)layout.alloc_bytes(static_cast<std::size_t>(gate_up_rows) *
-                             static_cast<std::size_t>(max_tokens) * sizeof(float));
+    if (q4_volta_mma_splits(gate_up_rows, input_rows, min_tokens) > 1) {
+        (void)layout.alloc_bytes(static_cast<std::size_t>(gate_up_rows) *
+                                 static_cast<std::size_t>(max_tokens) * sizeof(float));
+    }
     return layout.peak_bytes();
 #else
     (void)input_rows;

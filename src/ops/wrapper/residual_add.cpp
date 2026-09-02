@@ -12,6 +12,12 @@
 namespace ninfer::ops {
 namespace {
 
+bool overlaps(const Tensor& lhs, const Tensor& rhs) {
+    const auto lhs_begin = reinterpret_cast<std::uintptr_t>(lhs.data);
+    const auto rhs_begin = reinterpret_cast<std::uintptr_t>(rhs.data);
+    return lhs_begin < rhs_begin + rhs.bytes() && rhs_begin < lhs_begin + lhs.bytes();
+}
+
 std::int64_t numel_allow_zero(const Tensor& t) {
     std::int64_t total = 1;
     for (int d = 0; d < 4; ++d) {
@@ -64,6 +70,11 @@ void residual_add_two(const Tensor& a, const Tensor& b, Tensor& x, cudaStream_t 
     }
     if (a.data == nullptr || b.data == nullptr || x.data == nullptr) {
         throw std::invalid_argument("residual_add_two: a/b/x data must be non-null");
+    }
+    // In-place on x: a/b aliasing x would silently double-count. The split-K reduce always passes
+    // three distinct buffers, so any overlap is a caller error.
+    if (overlaps(a, x) || overlaps(b, x) || overlaps(a, b)) {
+        throw std::invalid_argument("residual_add_two: a/b/x must not overlap");
     }
 
     detail::residual_add_two_launch(a, b, x, stream); // single variant -> direct dispatch
