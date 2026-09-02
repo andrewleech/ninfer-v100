@@ -466,6 +466,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         // Split every main-model MLP's packed Q4 gate/up (by paired intermediate rows) and Q5 down
         // (by K columns) at kPrimaryIntermediate so the primary owns the first shard and the
         // secondary the rest. The loader materializer performs the physical cross-device repack.
+        // 8192 is the validated split (primary 11.09 GiB / secondary 4.83 GiB, runs correctly). Do
+        // not change it without re-validating on GPU: a trial at 9216 loaded but faulted during
+        // inference (cudaErrorIllegalAddress) -- some shard path is not fully split-agnostic at
+        // non-default splits (root cause not yet isolated). See DUAL-V100-BRINGUP-LOG.md.
         constexpr std::uint64_t kPrimaryIntermediate = 8192;
         for (const TextLayerPlan& layer : out.text_layers) {
             binder.shard_row_split_across_devices(layer.mlp.gate_up.object,
