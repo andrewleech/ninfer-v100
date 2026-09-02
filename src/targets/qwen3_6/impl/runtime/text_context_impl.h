@@ -33,7 +33,10 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -1073,6 +1076,37 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
     if (split == nullptr) {
         throw std::logic_error("tensor-parallel attention requires a split attention projection");
     }
+    // Env-gated per-phase timing (NINFER_TP_PROFILE). Each phase syncs its stream so the measured
+    // times are serialized wall-clock per phase -- diagnostic only, off by default.
+    static const bool tp_prof = std::getenv("NINFER_TP_PROFILE") != nullptr;
+    static std::atomic<double> t_proj{0}, t_unpack{0}, t_norm{0}, t_attn{0}, t_gate{0}, t_copy{0},
+        t_oproj{0};
+    static std::atomic<long> tp_calls{0};
+    struct TpDump {
+        ~TpDump() {
+            if (tp_calls.load() > 0) {
+                std::fprintf(stderr,
+                             "[tp-prof] attn calls=%ld  proj=%.2f unpack=%.2f norm=%.2f attn=%.2f "
+                             "gate=%.2f copy=%.2f oproj=%.2f (s)\n",
+                             tp_calls.load(), t_proj.load(), t_unpack.load(), t_norm.load(),
+                             t_attn.load(), t_gate.load(), t_copy.load(), t_oproj.load());
+            }
+        }
+    };
+    static TpDump tp_dump;
+    const auto tp_phase = [&](std::atomic<double>& acc, cudaStream_t st, auto&& fn) {
+        if (!tp_prof) {
+            fn();
+            return;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        const auto a = std::chrono::steady_clock::now();
+        fn();
+        CUDA_CHECK(cudaStreamSynchronize(st));
+        const auto b = std::chrono::steady_clock::now();
+        acc.store(acc.load() + std::chrono::duration<double>(b - a).count());
+    };
+
     const std::int32_t T           = x.ne[1];
     const std::int32_t hd          = kCfg.head_dim;
     const std::int32_t n_q_half    = kCfg.n_q / 2;
@@ -1144,43 +1178,50 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
                                   const Tensor& kv_rows, const Tensor& valid_cols, Tensor& a_half) {
         Tensor qk = W.alloc(DType::BF16, {shard_rows, T});
         Tensor gv = W.alloc(DType::BF16, {shard_rows, T});
-        ops::attn_input_proj_graph_shard(h_in, qk_w, gv_w, qk, gv, W, stream);
+        tp_phase(t_proj, stream,
+                 [&] { ops::attn_input_proj_graph_shard(h_in, qk_w, gv_w, qk, gv, W, stream); });
         Tensor q    = W.alloc(DType::BF16, {q_half_rows, T});
         Tensor k    = W.alloc(DType::BF16, {kv_half_rows, T});
         Tensor gate = W.alloc(DType::BF16, {q_half_rows, T});
         Tensor v    = W.alloc(DType::BF16, {kv_half_rows, T});
-        unpack(q, qk, 0, q_half_rows, stream);
-        unpack(k, qk, q_half_rows, kv_half_rows, stream);
-        unpack(gate, gv, 0, q_half_rows, stream);
-        unpack(v, gv, q_half_rows, kv_half_rows, stream);
+        tp_phase(t_unpack, stream, [&] {
+            unpack(q, qk, 0, q_half_rows, stream);
+            unpack(k, qk, q_half_rows, kv_half_rows, stream);
+            unpack(gate, gv, 0, q_half_rows, stream);
+            unpack(v, gv, q_half_rows, kv_half_rows, stream);
+        });
         Tensor qn  = W.alloc(DType::BF16, {q_half_rows, T});
         Tensor kn  = W.alloc(DType::BF16, {kv_half_rows, T});
         Tensor q3  = q.view({hd, n_q_half, T});
         Tensor k3  = k.view({hd, n_kv_half, T});
         Tensor qn3 = qn.view({hd, n_q_half, T});
         Tensor kn3 = kn.view({hd, n_kv_half, T});
-        ops::rmsnorm(q3, qnorm_w, kCfg.rms_eps, true, qn3, stream);
-        ops::rmsnorm(k3, knorm_w, kCfg.rms_eps, true, kn3, stream);
-        Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_pos.view({T}) : rope_pos;
-        ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn3, kn3, stream);
+        tp_phase(t_norm, stream, [&] {
+            ops::rmsnorm(q3, qnorm_w, kCfg.rms_eps, true, qn3, stream);
+            ops::rmsnorm(k3, knorm_w, kCfg.rms_eps, true, kn3, stream);
+            Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_pos.view({T}) : rope_pos;
+            ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn3, kn3, stream);
+        });
         Tensor a3 = a_half.view({hd, n_q_half, T});
         Tensor v3 = v.view({hd, n_kv_half, T});
-        if (active_sequence_batch_ != 0) {
-            const std::int32_t width = active_sequence_width_;
-            Tensor q_batch = qn.view({hd, n_q_half, width, active_sequence_batch_});
-            Tensor k_batch = kn.view({hd, n_kv_half, width, active_sequence_batch_});
-            Tensor v_batch = v.view({hd, n_kv_half, width, active_sequence_batch_});
-            Tensor a_batch = a_half.view({hd, n_q_half, width, active_sequence_batch_});
-            Tensor position_batch = cache_pos.view({width, active_sequence_batch_});
-            ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid_cols,
-                                          kv_rows, {hd, n_q_half, n_kv_half}, kAttnScale, kv_view,
-                                          *active_causal_attention_envelope_, W, a_batch, stream);
-        } else {
-            ops::causal_softmax_attention(qn3, kn3, v3, cache_pos, Tensor{}, kv_rows,
-                                          {hd, n_q_half, n_kv_half}, kAttnScale, kv_view,
-                                          *active_causal_attention_envelope_, W, a3, stream);
-        }
-        ops::sigmoid_mul(gate.view({hd, n_q_half, T}), a3, stream);
+        tp_phase(t_attn, stream, [&] {
+            if (active_sequence_batch_ != 0) {
+                const std::int32_t width = active_sequence_width_;
+                Tensor q_batch = qn.view({hd, n_q_half, width, active_sequence_batch_});
+                Tensor k_batch = kn.view({hd, n_kv_half, width, active_sequence_batch_});
+                Tensor v_batch = v.view({hd, n_kv_half, width, active_sequence_batch_});
+                Tensor a_batch = a_half.view({hd, n_q_half, width, active_sequence_batch_});
+                Tensor position_batch = cache_pos.view({width, active_sequence_batch_});
+                ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid_cols,
+                                              kv_rows, {hd, n_q_half, n_kv_half}, kAttnScale, kv_view,
+                                              *active_causal_attention_envelope_, W, a_batch, stream);
+            } else {
+                ops::causal_softmax_attention(qn3, kn3, v3, cache_pos, Tensor{}, kv_rows,
+                                              {hd, n_q_half, n_kv_half}, kAttnScale, kv_view,
+                                              *active_causal_attention_envelope_, W, a3, stream);
+            }
+        });
+        tp_phase(t_gate, stream, [&] { ops::sigmoid_mul(gate.view({hd, n_q_half, T}), a3, stream); });
     };
 
     // Primary hidden + the gather buffer for both head halves live in the primary mixer scope.
@@ -1226,10 +1267,14 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
     // full (unsharded) output projection on both halves and add into the residual.
     CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
     Tensor a_peer = work_.alloc(DType::BF16, {q_half_rows, T});
-    CUDA_CHECK(cudaMemcpyPeerAsync(a_peer.data, primary_device, secondary_a.data, secondary_device,
-                                   a_peer.bytes(), primary_stream));
-    scatter(a_full, a_peer, q_half_rows, primary_stream);
-    V::attention_output_projection(a_full, *w.o_proj, x, ph, work_, primary_stream);
+    tp_phase(t_copy, primary_stream, [&] {
+        CUDA_CHECK(cudaMemcpyPeerAsync(a_peer.data, primary_device, secondary_a.data,
+                                       secondary_device, a_peer.bytes(), primary_stream));
+        scatter(a_full, a_peer, q_half_rows, primary_stream);
+    });
+    tp_phase(t_oproj, primary_stream,
+             [&] { V::attention_output_projection(a_full, *w.o_proj, x, ph, work_, primary_stream); });
+    tp_calls.fetch_add(1);
 }
 
 template <class Tap>
