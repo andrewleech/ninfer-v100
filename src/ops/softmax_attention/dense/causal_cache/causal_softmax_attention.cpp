@@ -27,7 +27,8 @@ constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
-          (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
+          (geometry.query_heads == 16 && geometry.kv_heads == 2) ||
+          (geometry.query_heads == 12 && geometry.kv_heads == 2))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
 }
@@ -259,6 +260,8 @@ struct SmallTWorkspace {
 #ifdef NINFER_VOLTA_BUILD
 bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
                                 std::int32_t batch_size, DType cache_dtype) {
+    // 12-head (TP-attention) is deliberately excluded here so it takes the standard prompt/small_t
+    // path rather than the volta-flash fast path (which would need its own <12,2> instantiation).
     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
                                     q_heads == CausalD256H16Kv2::QHeads;
     return supported_geometry && batch_size == 1 &&

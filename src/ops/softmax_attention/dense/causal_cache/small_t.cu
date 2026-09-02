@@ -268,6 +268,9 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
     if (q_heads == CausalD256H16Kv2::QHeads) {
         return causal_small_t_launch_capacity<CausalD256H16Kv2>(envelope, tokens, cache_dtype);
     }
+    if (q_heads == CausalD256H12Kv2::QHeads) {
+        return causal_small_t_launch_capacity<CausalD256H12Kv2>(envelope, tokens, cache_dtype);
+    }
     throw std::invalid_argument(
         "causal_softmax_attention split capacity: unsupported head geometry");
 }
@@ -411,7 +414,13 @@ void causal_attention_small_t_launch(
                                                               partial_m, partial_l, out, stream);
         return;
     }
-    causal_attention_small_t_launch_for<CausalD256H16Kv2>(q, input, pos, scale, cache, invocation,
+    if (q.ne[1] == CausalD256H16Kv2::QHeads) {
+        causal_attention_small_t_launch_for<CausalD256H16Kv2>(q, input, pos, scale, cache,
+                                                              invocation, envelope, partial_acc,
+                                                              partial_m, partial_l, out, stream);
+        return;
+    }
+    causal_attention_small_t_launch_for<CausalD256H12Kv2>(q, input, pos, scale, cache, invocation,
                                                           envelope, partial_acc, partial_m,
                                                           partial_l, out, stream);
 }
@@ -442,7 +451,13 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
                                                               partial_m, partial_l, out, stream);
         return;
     }
-    causal_attention_small_t_launch_for<CausalD256H16Kv2>(q, input, pos, scale, batch_cache,
+    if (q.ne[1] == CausalD256H16Kv2::QHeads) {
+        causal_attention_small_t_launch_for<CausalD256H16Kv2>(q, input, pos, scale, batch_cache,
+                                                              invocation, envelope, partial_acc,
+                                                              partial_m, partial_l, out, stream);
+        return;
+    }
+    causal_attention_small_t_launch_for<CausalD256H12Kv2>(q, input, pos, scale, batch_cache,
                                                           invocation, envelope, partial_acc,
                                                           partial_m, partial_l, out, stream);
 }
