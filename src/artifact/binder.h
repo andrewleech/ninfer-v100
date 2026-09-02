@@ -31,6 +31,10 @@ struct DeviceMaterialization {
 enum class RowSplitShardAxis : std::uint8_t {
     PairedRows,
     Columns,
+    // Tensor-parallel attention projection: two unequal row bands (Q of `split` rows, then K/V of the
+    // remainder) each halved by head across the two cards, giving equal [rows/2, cols] shards. `split`
+    // is the Q-band boundary (q_size), not a tunable point -- the head split is always 50/50.
+    QkvHeadHalf,
 };
 
 struct RowSplitShardMaterialization {

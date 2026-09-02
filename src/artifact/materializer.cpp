@@ -93,59 +93,6 @@ DeviceSpan allocate_planned(DeviceArena& arena, std::uint64_t offset, std::uint6
     return storage;
 }
 
-void copy_peer_2d(void* destination, int destination_device, std::size_t destination_pitch,
-                  const void* source, int source_device, std::size_t source_pitch,
-                  std::size_t width, std::size_t height, cudaStream_t stream) {
-    if (width == 0 || height == 0 || width > source_pitch || width > destination_pitch) {
-        throw ArtifactError("row-split peer copy has invalid pitch geometry");
-    }
-    cudaMemcpy3DPeerParms params{};
-    params.srcPtr = make_cudaPitchedPtr(const_cast<void*>(source), source_pitch, width, height);
-    params.srcDevice = source_device;
-    params.dstPtr = make_cudaPitchedPtr(destination, destination_pitch, width, height);
-    params.dstDevice = destination_device;
-    params.extent = make_cudaExtent(width, height, 1);
-    CUDA_CHECK(cudaMemcpy3DPeerAsync(&params, stream));
-}
-
-void copy_row_split_region(std::byte* destination, const RowSplitGeometry& destination_geometry,
-                           std::uint64_t destination_row, const std::byte* source,
-                           const RowSplitGeometry& source_geometry, std::uint64_t source_row,
-                           std::uint64_t source_group, std::uint64_t rows,
-                           std::uint64_t groups, int destination_device, int source_device,
-                           cudaStream_t stream, std::uint64_t& copied_bytes) {
-    struct Plane {
-        std::uint64_t source_offset;
-        std::uint64_t destination_offset;
-        std::uint64_t bytes_per_group;
-    };
-    const std::array planes = {
-        Plane{0, 0, source_geometry.low_bytes_per_group},
-        Plane{source_geometry.high_plane_offset, destination_geometry.high_plane_offset,
-              source_geometry.high_bytes_per_group},
-        Plane{source_geometry.scale_plane_offset, destination_geometry.scale_plane_offset, 2},
-    };
-    for (const Plane& plane : planes) {
-        if (plane.bytes_per_group == 0) { continue; }
-        const std::uint64_t source_pitch =
-            source_geometry.groups_per_row * plane.bytes_per_group;
-        const std::uint64_t destination_pitch =
-            destination_geometry.groups_per_row * plane.bytes_per_group;
-        const std::uint64_t width = groups * plane.bytes_per_group;
-        const std::uint64_t source_offset =
-            plane.source_offset + source_row * source_pitch +
-            source_group * plane.bytes_per_group;
-        const std::uint64_t destination_offset =
-            plane.destination_offset + destination_row * destination_pitch;
-        copy_peer_2d(destination + destination_offset, destination_device,
-                     static_cast<std::size_t>(destination_pitch), source + source_offset,
-                     source_device, static_cast<std::size_t>(source_pitch),
-                     static_cast<std::size_t>(width), static_cast<std::size_t>(rows), stream);
-        copied_bytes = checked_add(copied_bytes, width * rows,
-                                   "peer copied byte count overflows u64");
-    }
-}
-
 // Host-source counterpart of copy_row_split_region: the same 2D per-plane geometry, but the source
 // is the mmap'd artifact in host memory, so it uses cudaMemcpy2DAsync (host->device) rather than a
 // peer copy. Used by the fit-friendly shard load, which never stages the full tensor on a device.
@@ -214,6 +161,11 @@ void copy_row_split_shard_from_host(const Reader& reader,
         const std::uint64_t intermediate = tensor->shape[0] / 2;
         primary_shape   = {2 * shard.split, tensor->shape[1]};
         secondary_shape = {2 * (intermediate - shard.split), tensor->shape[1]};
+    } else if (shard.axis == RowSplitShardAxis::QkvHeadHalf) {
+        const std::uint64_t q_total  = shard.split;
+        const std::uint64_t kv_total = tensor->shape[0] - shard.split;
+        primary_shape   = {q_total / 2 + kv_total / 2, tensor->shape[1]};
+        secondary_shape = {(q_total - q_total / 2) + (kv_total - kv_total / 2), tensor->shape[1]};
     } else {
         primary_shape   = {tensor->shape[0], shard.split};
         secondary_shape = {tensor->shape[0], tensor->shape[1] - shard.split};
@@ -244,6 +196,28 @@ void copy_row_split_shard_from_host(const Reader& reader,
                                    source_geometry.groups_per_row, stream, copied_bytes);
         return;
     }
+    if (shard.axis == RowSplitShardAxis::QkvHeadHalf) {
+        // Source is [Q(q_total) | K/V(kv_total)]; each band halves by head. Primary takes the first
+        // half of each band, secondary the rest, packed contiguously into [rows/2, cols] shards.
+        const std::uint64_t g        = source_geometry.groups_per_row;
+        const std::uint64_t q_total  = shard.split;
+        const std::uint64_t kv_total = tensor->shape[0] - shard.split;
+        const std::uint64_t q_half   = q_total / 2;
+        const std::uint64_t kv_half  = kv_total / 2;
+        const std::uint64_t sec_q    = q_total - q_half;
+        const std::uint64_t sec_kv   = kv_total - kv_half;
+        // primary: Q[0:q_half] then K[0:kv_half]
+        copy_row_split_region_host(primary, primary_geometry, 0, source, source_geometry, 0, 0,
+                                   q_half, g, stream, copied_bytes);
+        copy_row_split_region_host(primary, primary_geometry, q_half, source, source_geometry,
+                                   q_total, 0, kv_half, g, stream, copied_bytes);
+        // secondary: Q[q_half:q_total] then K[kv_half:kv_total]
+        copy_row_split_region_host(secondary, secondary_geometry, 0, source, source_geometry,
+                                   q_half, 0, sec_q, g, stream, copied_bytes);
+        copy_row_split_region_host(secondary, secondary_geometry, sec_q, source, source_geometry,
+                                   q_total + kv_half, 0, sec_kv, g, stream, copied_bytes);
+        return;
+    }
 
     const std::uint64_t primary_groups   = primary_geometry.groups_per_row;
     const std::uint64_t secondary_groups = secondary_geometry.groups_per_row;
@@ -252,69 +226,6 @@ void copy_row_split_shard_from_host(const Reader& reader,
     copy_row_split_region_host(secondary, secondary_geometry, 0, source, source_geometry, 0,
                                primary_groups, source_geometry.rows, secondary_groups, stream,
                                copied_bytes);
-}
-
-void copy_row_split_shard(const Reader& reader, const RowSplitShardMaterialization& shard,
-                          const void* source_storage, void* primary_storage,
-                          void* secondary_storage, int primary_device, int secondary_device,
-                          cudaStream_t stream, std::uint64_t primary_bytes,
-                          std::uint64_t secondary_bytes, std::uint64_t& copied_bytes) {
-    const auto* tensor =
-        std::get_if<TensorDescriptor>(&reader.objects().at(shard.object.index));
-    if (tensor == nullptr || tensor->layout != StorageLayout::RowSplitK128V1 ||
-        tensor->shape.size() != 2) {
-        throw ArtifactError("cross-device shard does not describe a row-split tensor");
-    }
-    const RowSplitGeometry source_geometry = row_split_geometry(tensor->format, tensor->shape);
-    std::array<std::uint64_t, 2> primary_shape{};
-    std::array<std::uint64_t, 2> secondary_shape{};
-    if (shard.axis == RowSplitShardAxis::PairedRows) {
-        const std::uint64_t intermediate = tensor->shape[0] / 2;
-        primary_shape   = {2 * shard.split, tensor->shape[1]};
-        secondary_shape = {2 * (intermediate - shard.split), tensor->shape[1]};
-    } else {
-        primary_shape   = {tensor->shape[0], shard.split};
-        secondary_shape = {tensor->shape[0], tensor->shape[1] - shard.split};
-    }
-    const RowSplitGeometry primary_geometry =
-        row_split_geometry(tensor->format, primary_shape);
-    const RowSplitGeometry secondary_geometry =
-        row_split_geometry(tensor->format, secondary_shape);
-    if (primary_geometry.encoded_bytes != primary_bytes ||
-        secondary_geometry.encoded_bytes != secondary_bytes) {
-        throw ArtifactError("cross-device shard bytes do not match the packed plan");
-    }
-
-    const auto* source = static_cast<const std::byte*>(source_storage);
-    auto* primary      = static_cast<std::byte*>(primary_storage);
-    auto* secondary    = static_cast<std::byte*>(secondary_storage);
-    if (shard.axis == RowSplitShardAxis::PairedRows) {
-        const std::uint64_t intermediate  = tensor->shape[0] / 2;
-        const std::uint64_t secondary_rows = intermediate - shard.split;
-        copy_row_split_region(primary, primary_geometry, 0, source, source_geometry, 0, 0,
-                              shard.split, source_geometry.groups_per_row, secondary_device,
-                              primary_device, stream, copied_bytes);
-        copy_row_split_region(primary, primary_geometry, shard.split, source, source_geometry,
-                              intermediate, 0, shard.split, source_geometry.groups_per_row,
-                              secondary_device, primary_device, stream, copied_bytes);
-        copy_row_split_region(secondary, secondary_geometry, 0, source, source_geometry,
-                              shard.split, 0, secondary_rows, source_geometry.groups_per_row,
-                              secondary_device, primary_device, stream, copied_bytes);
-        copy_row_split_region(secondary, secondary_geometry, secondary_rows, source,
-                              source_geometry, intermediate + shard.split, 0, secondary_rows,
-                              source_geometry.groups_per_row, secondary_device, primary_device,
-                              stream, copied_bytes);
-        return;
-    }
-
-    const std::uint64_t primary_groups   = primary_geometry.groups_per_row;
-    const std::uint64_t secondary_groups = secondary_geometry.groups_per_row;
-    copy_row_split_region(primary, primary_geometry, 0, source, source_geometry, 0, 0,
-                          source_geometry.rows, primary_groups, secondary_device, primary_device,
-                          stream, copied_bytes);
-    copy_row_split_region(secondary, secondary_geometry, 0, source, source_geometry, 0,
-                          primary_groups, source_geometry.rows, secondary_groups,
-                          secondary_device, primary_device, stream, copied_bytes);
 }
 
 } // namespace

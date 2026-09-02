@@ -213,6 +213,12 @@ MaterializationPlan Binder::finish() {
                     const std::uint64_t intermediate = rows / 2;
                     primary_shape   = {2 * shard->split, cols};
                     secondary_shape = {2 * (intermediate - shard->split), cols};
+                } else if (shard->axis == RowSplitShardAxis::QkvHeadHalf) {
+                    // split = Q-band rows; each band (Q, then K/V) halves by head.
+                    const std::uint64_t q_total  = shard->split;
+                    const std::uint64_t kv_total = rows - shard->split;
+                    primary_shape   = {q_total / 2 + kv_total / 2, cols};
+                    secondary_shape = {(q_total - q_total / 2) + (kv_total - kv_total / 2), cols};
                 } else {
                     primary_shape   = {rows, shard->split};
                     secondary_shape = {rows, cols - shard->split};
