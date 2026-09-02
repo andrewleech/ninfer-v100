@@ -195,3 +195,50 @@ graph. MTP recovers most of it. 58 tok/s is near the practical ceiling for this 
    tighter fit).
 4. **Per-device CUDA sub-graphs** to cut eager launch overhead (hard — the cross-device fence is why
    full-graph capture is disabled).
+
+---
+
+## Phase 7 — tensor-parallel attention (the 262K-context lever)
+
+Goal (Andrew's steer): serve the **full 262K context**. KV is ~33 KiB/token int8 (measured 132 MiB
+@4096) → ~8.25 GiB at 262K, but the primary has only ~3.2 GiB free after weights, so a single pool
+tops out around 64–72K. TP attention splits each of the 16 full-attention layers **24 q / 4 kv →
+12 q / 2 kv per card**, which halves the primary's text KV (→ ~4.1 GiB/card, the fit enabler) and
+also puts the otherwise-idle secondary to work during attention (prefill speedup + local decode, no
+remote-KV latency). 262K is effectively single-session (weights 16 + KV 8.25 = 24 of 32 GiB).
+
+Landed behind the opt-in `NINFER_TP_ATTENTION` env flag (dual-device only; 35B unaffected). Six
+commits build the compute + load half, two the runtime half:
+
+- **TP-A1/A2** — the `<12,2>` per-card causal geometry, the `attn_input_proj_graph_shard` projection
+  op (two runtime-shaped Volta GEMMs), the `QkvHeadHalf` row-split axis, and load-time attention
+  weight sharding (each full-attn layer's query_key/gate_value → two `[3584,5120]` Q4/Q5 shards).
+- **TP-A3 (by-head KV dual pool)** — `DecoderStateSpec.text_kv_heads` halves *only* the text pool
+  (MTP stays at full kv_heads); a secondary text `DecoderState` is allocated on rank 1. It carries no
+  reservation lifecycle of its own — the primary's block table is mirrored into its execution matrix
+  each layer, so both pools address identical physical slots. `tp_attention` is derived in the shared
+  planner (gated on `supports_graph_parallel`) and threaded to `TextContext`.
+- **TP-A4 (attn_mix orchestration)** — mirrors the `post_mixer_graph` fence. Each card projects its
+  shard, unpacks the packed q|k / gate|v into contiguous buffers (a strided 2-D copy, since `view`
+  requires contiguity), runs q/k norm + RoPE + a **local** GQA against its two KV heads, and gates.
+  The two `[3072,T]` halves are gathered `[primary | secondary]` — which reproduces head order 0..23
+  for the load-side shard — and the **full unsharded o_proj** runs on the primary.
+
+**Design choice:** o_proj is *not* sharded (gather + full projection on the primary) — this avoids
+touching the generic `ModelView` output weight; only query_key/gate_value shard.
+
+**Status:** compile-validated sm_70 (both `variant.cpp`, zero errors); an agent review confirmed
+flag-off is byte-for-byte the prior path and all the plumbing is sound. **Not yet GPU-validated (TP-A5).**
+
+### Known limitations / TP-A5 watch-items
+
+- **Host-KV offload gap** — the secondary pool is not wired into the host-KV offload/checkpoint
+  machinery, so heads 2–3 would desync on an evict→restore. Fine for the 262K single-session target
+  (no eviction); a real gap for cached/concurrent serving.
+- **Block-table mirror is per-layer** (16×/step) though the matrix is layer-invariant — correct but
+  hoistable to once/step.
+- **Workspace headroom** — `attn_mix_graph`'s transients (plus the shard split-K accumulator) may
+  exceed the planned `general_capacity`; if the arena throws at runtime, bump the workspace plan.
+
+**TP-A5** = build + run `NINFER_TP_ATTENTION=1 --devices 1,2`, greedy/logit parity vs the MLP-only
+path (tp-on vs tp-off A/B), measure the prefill gain, and confirm 262K KV actually fits.
