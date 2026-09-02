@@ -279,3 +279,38 @@ layer-invariant), replicate q/k norms on rank 1 at load to kill per-layer norm c
 once/step, and improve stream overlap — but the eager per-layer cross-device round-trip is fundamental to
 this design, so a full recovery to tp-off prefill speed is unlikely without CUDA-graph capture of the
 cross-device schedule.
+
+### TP-R: full 262K + prefill recovered (both fixed)
+
+The TP-A5 caveats above were **both resolved**. Full 262K is the minimum-viable target, so:
+
+**262K now fits (TP-R1 — MLP rebalance).** The primary is weight-heavy, so shift MLP intermediate to the
+idle secondary via a shared, env-overridable split accessor (`NINFER_MLP_PRIMARY`). The old "9216 faulted"
+note was a *heavier*-primary trial in the wrong direction; a **lighter** primary is clean. Under TP the
+default is now 4096 (secondary takes 13312), which drops primary weights 10.76 → 8.61 GiB and lifts
+free-after-weights 4.70 → 6.85 GiB. The full 262144 KV (4.12 GiB) then loads and generates with 911 MiB to
+spare. Turnkey — no extra flag needed:
+
+    NINFER_TP_ATTENTION=1 --devices 1,2 --max-context 262144 --kv-capacity 262144 --kv-dtype int8
+
+**Prefill recovered 6.1× (TP-R2 — flash for 12q/2kv).** Env-gated per-phase timing
+(`NINFER_TP_PROFILE`) pinned the 7.6× regression precisely: over 64 layer-invocations the **attention
+kernel was 8.29 s** while unpack/norm/gate/copy were each ~0.01 s — the strided-copy theory was wrong. Root
+cause: `volta_flash_route_possible` excluded 12-head geometry, so the per-card half fell back to the slow
+standard prompt kernel while tp-off's 24q/4kv used the fused flash path. 12q/2kv is GQA ratio 6 (same as
+24q/4kv), so a `VoltaFlashTiling<CausalD256H12Kv2> = {ncols2 2, ncols1 16}` instantiation drops straight
+in. Result: attention 8.29 → 0.18 s, **prefill 78 → 474 tok/s** (now 1.26× of the tp-off 597, was 7.6×
+slower), greedy output **byte-identical** to tp-off on a flash-exercising prompt.
+
+**Final state (turnkey `NINFER_TP_ATTENTION=1`, MLP auto-4096):**
+
+| Metric | tp-off | tp-on (final) |
+|---|---|---|
+| Max context | ~98K | **262144 (full)** |
+| Prefill @41K | 597 tok/s | 474 tok/s (1.26×) |
+| Greedy parity | — | **exact** |
+| Primary weights / KV | 11.09 / 132 MiB | 8.61 GiB / 66 MiB |
+
+Remaining: decode at the 4096 split is ~14 tok/s (the split unbalances the MLP shards; MTP would lift it,
+or a context-aware split could balance better below 262K). The projection GEMM (0.51 s) is now the largest
+TP phase — the next prefill lever if wanted.
