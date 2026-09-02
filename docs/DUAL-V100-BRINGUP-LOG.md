@@ -242,3 +242,40 @@ flag-off is byte-for-byte the prior path and all the plumbing is sound. **Not ye
 
 **TP-A5** = build + run `NINFER_TP_ATTENTION=1 --devices 1,2`, greedy/logit parity vs the MLP-only
 path (tp-on vs tp-off A/B), measure the prefill gain, and confirm 262K KV actually fits.
+
+### TP-A5 results (measured on titan, 2×V100, qwen3_8_27b groupwise, int8 KV, greedy)
+
+| Metric | tp-off (MLP-only) | tp-on (NINFER_TP_ATTENTION=1) |
+|---|---|---|
+| Greedy output | 48 tokens | **identical 48 tokens** (exact parity) |
+| Primary KV payload @4096 | 132 MiB | **66 MiB** (kv_heads 4→2) |
+| GPU weights (primary) | 11.09 GiB | 10.76 GiB (sharded proj) |
+| Max single-session context | ~98K (98304 fits, 114688 doesn't) | **~213K** (212992 fits, 221184 doesn't) |
+| Prefill @41K tokens | **597 tok/s** | 78 tok/s |
+| Decode @41K | 18.3 tok/s | 16.8 tok/s |
+
+**The good:** exact correctness, and TP-attention **~2.17×'s the max context** (~98K → ~213K) by halving
+the primary KV. At 128K, tp-off can't fit but tp-on does. This is the 262K-context lever working.
+
+**The bad — this is a context-capacity feature, not a speedup.** Prefill is **7.6× *slower*** (597 → 78
+tok/s; reproducible on a warm re-run, so not cold-JIT), and decode ~8% slower. The hypothesised prefill
+gain (secondary attends during prefill) is dwarfed by the **eager per-attention-layer cross-device
+overhead**: ~7 peer copies (hidden + norms + positions + block-table mirror + result-back), 4 strided
+`cudaMemcpy2DAsync` unpacks per card, cross-stream event syncs (the o_proj waits on the secondary), and a
+`cudaSetDevice` per layer — ~1.4 s of pure overhead per attn-layer-invocation, with no CUDA-graph capture
+to amortise it (`model_parallel` forces eager). So TP-attention here **buys ~2× context at a steep
+prefill/decode cost**; use it when you need 150–213K context on 2×V100 and can eat a slow prefill.
+
+**262K still doesn't fit** (~213K max): at 262K the primary needs 5.95 GiB but has 4.70 GiB free — the
+primary is weight-heavy, so full 262K also needs the **MLP-split rebalance** (move ~0.8 GiB of MLP weight
+to the idle secondary — the open 9216 illegal-access bug). Shrinking `--prefill-chunk` only recovers ~0.5
+GiB (the GDN state images are a ~1.5 GiB fixed overhead).
+
+**One load bug fixed here** (`53976384`): the binder validated the `QkvHeadHalf` shard as a *column* split
+(6144 > cols 5120) and aborted the load; added the row-split validation branch.
+
+**Perf-recovery ideas (future, uncertain):** hoist the block-table mirror to once/step (it's
+layer-invariant), replicate q/k norms on rank 1 at load to kill per-layer norm copies, mirror positions
+once/step, and improve stream overlap — but the eager per-layer cross-device round-trip is fundamental to
+this design, so a full recovery to tp-off prefill speed is unlikely without CUDA-graph capture of the
+cross-device schedule.
