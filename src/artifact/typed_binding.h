@@ -27,6 +27,7 @@ class MaterializedArtifact;
 
 [[nodiscard]] Weight materialized_weight(const MaterializedArtifact& materialized,
                                          ObjectHandle handle, NumericFormat format,
-                                         std::int32_t rows, std::int32_t columns);
+                                         std::int32_t rows, std::int32_t columns,
+                                         std::size_t device_rank = 0);
 
 } // namespace ninfer::artifact

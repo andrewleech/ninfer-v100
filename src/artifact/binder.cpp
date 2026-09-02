@@ -1,6 +1,7 @@
 #include "artifact/binder.h"
 
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -94,9 +95,61 @@ void Binder::materialize_on_device(ObjectHandle handle) {
         throw ArtifactError("materialization plan size overflows u64");
     }
     materialization_.device_objects.push_back(
-        DeviceMaterialization{handle, offset, tensor->bytes, alignment});
-    materialization_.device_capacity_bytes = offset + tensor->bytes;
-    planned_[handle.index]                 = true;
+        DeviceMaterialization{.object         = handle,
+                              .offset         = offset,
+                              .bytes          = tensor->bytes,
+                              .alignment      = alignment,
+                              .primary_offset = offset,
+                              .primary_bytes  = tensor->bytes});
+    materialization_.device_capacity_bytes        = offset + tensor->bytes;
+    materialization_.source_device_capacity_bytes = materialization_.device_capacity_bytes;
+    planned_[handle.index]                        = true;
+}
+
+void Binder::shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAxis axis,
+                                            std::uint64_t split) {
+    const auto* tensor = std::get_if<TensorDescriptor>(&descriptor(handle));
+    if (tensor == nullptr || tensor->layout != StorageLayout::RowSplitK128V1 ||
+        tensor->shape.size() != 2) {
+        throw ArtifactError("only rank-two row-split tensors can be sharded across devices");
+    }
+    const auto placement = std::find_if(
+        materialization_.device_objects.begin(), materialization_.device_objects.end(),
+        [&](const DeviceMaterialization& item) { return item.object.index == handle.index; });
+    if (placement == materialization_.device_objects.end()) {
+        throw ArtifactError("cross-device shard tensor is not materialized on the device");
+    }
+    const auto duplicate = std::find_if(
+        materialization_.row_split_shards.begin(), materialization_.row_split_shards.end(),
+        [&](const RowSplitShardMaterialization& item) {
+            return item.object.index == handle.index;
+        });
+    if (duplicate != materialization_.row_split_shards.end()) {
+        throw ArtifactError("tensor was assigned more than one cross-device shard");
+    }
+
+    const std::uint64_t rows = tensor->shape[0];
+    const std::uint64_t cols = tensor->shape[1];
+    if (axis == RowSplitShardAxis::PairedRows) {
+        if ((rows % 2) != 0 || split == 0 || split >= rows / 2) {
+            throw ArtifactError("paired-row shard split is outside the logical row range");
+        }
+    } else {
+        if (split == 0 || split >= cols) {
+            throw ArtifactError("column shard split is outside the logical column range");
+        }
+        const std::array<std::uint64_t, 2> split_shape = {1, split};
+        if (row_split_geometry(tensor->format, split_shape).padded_columns != split) {
+            throw ArtifactError(
+                "column shard split must preserve the row-split-k128 group boundary");
+        }
+    }
+
+    materialization_.row_split_shards.push_back(RowSplitShardMaterialization{
+        .object = handle,
+        .axis   = axis,
+        .split  = split,
+    });
 }
 
 void Binder::retain_on_host(ObjectHandle handle) {
@@ -133,6 +186,56 @@ MaterializationPlan Binder::finish() {
         const auto index = static_cast<std::size_t>(unplanned - planned_.begin());
         throw ArtifactError("artifact object has no materialization placement: " +
                             std::string(object_name(reader_.objects()[index])));
+    }
+
+    if (!materialization_.row_split_shards.empty()) {
+        materialization_.source_device_capacity_bytes =
+            materialization_.device_capacity_bytes;
+        std::uint64_t primary_capacity   = 0;
+        std::uint64_t secondary_capacity = 0;
+        for (DeviceMaterialization& placement : materialization_.device_objects) {
+            placement.primary_offset = align_up(primary_capacity, placement.alignment);
+            const auto shard = std::find_if(
+                materialization_.row_split_shards.begin(),
+                materialization_.row_split_shards.end(),
+                [&](const RowSplitShardMaterialization& item) {
+                    return item.object.index == placement.object.index;
+                });
+            if (shard == materialization_.row_split_shards.end()) {
+                placement.primary_bytes = placement.bytes;
+            } else {
+                const auto& tensor = std::get<TensorDescriptor>(descriptor(placement.object));
+                const std::uint64_t rows = tensor.shape[0];
+                const std::uint64_t cols = tensor.shape[1];
+                std::array<std::uint64_t, 2> primary_shape{};
+                std::array<std::uint64_t, 2> secondary_shape{};
+                if (shard->axis == RowSplitShardAxis::PairedRows) {
+                    const std::uint64_t intermediate = rows / 2;
+                    primary_shape   = {2 * shard->split, cols};
+                    secondary_shape = {2 * (intermediate - shard->split), cols};
+                } else {
+                    primary_shape   = {rows, shard->split};
+                    secondary_shape = {rows, cols - shard->split};
+                }
+                placement.primary_bytes =
+                    row_split_geometry(tensor.format, primary_shape).encoded_bytes;
+                shard->secondary_offset = align_up(secondary_capacity, placement.alignment);
+                shard->secondary_bytes =
+                    row_split_geometry(tensor.format, secondary_shape).encoded_bytes;
+                if (shard->secondary_bytes >
+                    std::numeric_limits<std::uint64_t>::max() - shard->secondary_offset) {
+                    throw ArtifactError("secondary materialization plan size overflows u64");
+                }
+                secondary_capacity = shard->secondary_offset + shard->secondary_bytes;
+            }
+            if (placement.primary_bytes >
+                std::numeric_limits<std::uint64_t>::max() - placement.primary_offset) {
+                throw ArtifactError("primary materialization plan size overflows u64");
+            }
+            primary_capacity = placement.primary_offset + placement.primary_bytes;
+        }
+        materialization_.device_capacity_bytes           = primary_capacity;
+        materialization_.secondary_device_capacity_bytes = secondary_capacity;
     }
     return std::move(materialization_);
 }

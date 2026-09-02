@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <limits>
@@ -65,13 +66,197 @@ struct ReadSpan {
     std::uint64_t end   = 0;
 };
 
+const RowSplitShardMaterialization*
+find_row_split_shard(const MaterializationPlan& plan, ObjectHandle object) {
+    const auto it = std::find_if(
+        plan.row_split_shards.begin(), plan.row_split_shards.end(),
+        [&](const RowSplitShardMaterialization& shard) {
+            return shard.object.index == object.index;
+        });
+    return it == plan.row_split_shards.end() ? nullptr : &*it;
+}
+
+DeviceSpan allocate_planned(DeviceArena& arena, std::uint64_t offset, std::uint64_t bytes,
+                            std::uint64_t alignment, const char* label) {
+    if (bytes == 0 || bytes > static_cast<std::uint64_t>(SIZE_MAX) ||
+        alignment == 0 || alignment > static_cast<std::uint64_t>(SIZE_MAX)) {
+        throw ArtifactError(std::string(label) + " has invalid allocation geometry");
+    }
+    const DeviceSpan storage = arena.alloc_bytes(static_cast<std::size_t>(bytes),
+                                                 static_cast<std::size_t>(alignment));
+    const auto actual_offset =
+        static_cast<std::uint64_t>(static_cast<std::byte*>(storage.data) -
+                                   static_cast<std::byte*>(arena.base()));
+    if (actual_offset != offset) {
+        throw ArtifactError(std::string(label) + " offset does not match its packed plan");
+    }
+    return storage;
+}
+
+void copy_peer_2d(void* destination, int destination_device, std::size_t destination_pitch,
+                  const void* source, int source_device, std::size_t source_pitch,
+                  std::size_t width, std::size_t height, cudaStream_t stream) {
+    if (width == 0 || height == 0 || width > source_pitch || width > destination_pitch) {
+        throw ArtifactError("row-split peer copy has invalid pitch geometry");
+    }
+    cudaMemcpy3DPeerParms params{};
+    params.srcPtr = make_cudaPitchedPtr(const_cast<void*>(source), source_pitch, width, height);
+    params.srcDevice = source_device;
+    params.dstPtr = make_cudaPitchedPtr(destination, destination_pitch, width, height);
+    params.dstDevice = destination_device;
+    params.extent = make_cudaExtent(width, height, 1);
+    CUDA_CHECK(cudaMemcpy3DPeerAsync(&params, stream));
+}
+
+void copy_row_split_region(std::byte* destination, const RowSplitGeometry& destination_geometry,
+                           std::uint64_t destination_row, const std::byte* source,
+                           const RowSplitGeometry& source_geometry, std::uint64_t source_row,
+                           std::uint64_t source_group, std::uint64_t rows,
+                           std::uint64_t groups, int destination_device, int source_device,
+                           cudaStream_t stream, std::uint64_t& copied_bytes) {
+    struct Plane {
+        std::uint64_t source_offset;
+        std::uint64_t destination_offset;
+        std::uint64_t bytes_per_group;
+    };
+    const std::array planes = {
+        Plane{0, 0, source_geometry.low_bytes_per_group},
+        Plane{source_geometry.high_plane_offset, destination_geometry.high_plane_offset,
+              source_geometry.high_bytes_per_group},
+        Plane{source_geometry.scale_plane_offset, destination_geometry.scale_plane_offset, 2},
+    };
+    for (const Plane& plane : planes) {
+        if (plane.bytes_per_group == 0) { continue; }
+        const std::uint64_t source_pitch =
+            source_geometry.groups_per_row * plane.bytes_per_group;
+        const std::uint64_t destination_pitch =
+            destination_geometry.groups_per_row * plane.bytes_per_group;
+        const std::uint64_t width = groups * plane.bytes_per_group;
+        const std::uint64_t source_offset =
+            plane.source_offset + source_row * source_pitch +
+            source_group * plane.bytes_per_group;
+        const std::uint64_t destination_offset =
+            plane.destination_offset + destination_row * destination_pitch;
+        copy_peer_2d(destination + destination_offset, destination_device,
+                     static_cast<std::size_t>(destination_pitch), source + source_offset,
+                     source_device, static_cast<std::size_t>(source_pitch),
+                     static_cast<std::size_t>(width), static_cast<std::size_t>(rows), stream);
+        copied_bytes = checked_add(copied_bytes, width * rows,
+                                   "peer copied byte count overflows u64");
+    }
+}
+
+void copy_row_split_shard(const Reader& reader, const RowSplitShardMaterialization& shard,
+                          const void* source_storage, void* primary_storage,
+                          void* secondary_storage, int primary_device, int secondary_device,
+                          cudaStream_t stream, std::uint64_t primary_bytes,
+                          std::uint64_t secondary_bytes, std::uint64_t& copied_bytes) {
+    const auto* tensor =
+        std::get_if<TensorDescriptor>(&reader.objects().at(shard.object.index));
+    if (tensor == nullptr || tensor->layout != StorageLayout::RowSplitK128V1 ||
+        tensor->shape.size() != 2) {
+        throw ArtifactError("cross-device shard does not describe a row-split tensor");
+    }
+    const RowSplitGeometry source_geometry = row_split_geometry(tensor->format, tensor->shape);
+    std::array<std::uint64_t, 2> primary_shape{};
+    std::array<std::uint64_t, 2> secondary_shape{};
+    if (shard.axis == RowSplitShardAxis::PairedRows) {
+        const std::uint64_t intermediate = tensor->shape[0] / 2;
+        primary_shape   = {2 * shard.split, tensor->shape[1]};
+        secondary_shape = {2 * (intermediate - shard.split), tensor->shape[1]};
+    } else {
+        primary_shape   = {tensor->shape[0], shard.split};
+        secondary_shape = {tensor->shape[0], tensor->shape[1] - shard.split};
+    }
+    const RowSplitGeometry primary_geometry =
+        row_split_geometry(tensor->format, primary_shape);
+    const RowSplitGeometry secondary_geometry =
+        row_split_geometry(tensor->format, secondary_shape);
+    if (primary_geometry.encoded_bytes != primary_bytes ||
+        secondary_geometry.encoded_bytes != secondary_bytes) {
+        throw ArtifactError("cross-device shard bytes do not match the packed plan");
+    }
+
+    const auto* source = static_cast<const std::byte*>(source_storage);
+    auto* primary      = static_cast<std::byte*>(primary_storage);
+    auto* secondary    = static_cast<std::byte*>(secondary_storage);
+    if (shard.axis == RowSplitShardAxis::PairedRows) {
+        const std::uint64_t intermediate  = tensor->shape[0] / 2;
+        const std::uint64_t secondary_rows = intermediate - shard.split;
+        copy_row_split_region(primary, primary_geometry, 0, source, source_geometry, 0, 0,
+                              shard.split, source_geometry.groups_per_row, secondary_device,
+                              primary_device, stream, copied_bytes);
+        copy_row_split_region(primary, primary_geometry, shard.split, source, source_geometry,
+                              intermediate, 0, shard.split, source_geometry.groups_per_row,
+                              secondary_device, primary_device, stream, copied_bytes);
+        copy_row_split_region(secondary, secondary_geometry, 0, source, source_geometry,
+                              shard.split, 0, secondary_rows, source_geometry.groups_per_row,
+                              secondary_device, primary_device, stream, copied_bytes);
+        copy_row_split_region(secondary, secondary_geometry, secondary_rows, source,
+                              source_geometry, intermediate + shard.split, 0, secondary_rows,
+                              source_geometry.groups_per_row, secondary_device, primary_device,
+                              stream, copied_bytes);
+        return;
+    }
+
+    const std::uint64_t primary_groups   = primary_geometry.groups_per_row;
+    const std::uint64_t secondary_groups = secondary_geometry.groups_per_row;
+    copy_row_split_region(primary, primary_geometry, 0, source, source_geometry, 0, 0,
+                          source_geometry.rows, primary_groups, secondary_device, primary_device,
+                          stream, copied_bytes);
+    copy_row_split_region(secondary, secondary_geometry, 0, source, source_geometry, 0,
+                          primary_groups, source_geometry.rows, secondary_groups,
+                          secondary_device, primary_device, stream, copied_bytes);
+}
+
 } // namespace
 
+void MaterializedArtifact::release_device_arenas() noexcept {
+    int saved_device = -1;
+    (void)cudaGetDevice(&saved_device);
+    for (std::size_t rank = device_arenas_.size(); rank-- > 0;) {
+        if (rank < device_arena_devices_.size()) {
+            (void)cudaSetDevice(device_arena_devices_[rank]);
+        }
+        device_arenas_[rank].reset();
+    }
+    if (saved_device >= 0) { (void)cudaSetDevice(saved_device); }
+    device_arenas_.clear();
+    device_arena_devices_.clear();
+}
+
+MaterializedArtifact::~MaterializedArtifact() { release_device_arenas(); }
+
+MaterializedArtifact::MaterializedArtifact(MaterializedArtifact&& other) noexcept
+    : device_arenas_(std::move(other.device_arenas_)),
+      device_arena_devices_(std::move(other.device_arena_devices_)),
+      objects_(std::move(other.objects_)), stats_(other.stats_) {}
+
+MaterializedArtifact& MaterializedArtifact::operator=(MaterializedArtifact&& other) noexcept {
+    if (this == &other) { return *this; }
+    release_device_arenas();
+    device_arenas_        = std::move(other.device_arenas_);
+    device_arena_devices_ = std::move(other.device_arena_devices_);
+    objects_              = std::move(other.objects_);
+    stats_                = other.stats_;
+    return *this;
+}
+
 void* MaterializedArtifact::device_data(ObjectHandle handle) const {
-    if (handle.index >= objects_.size() || objects_[handle.index].device == nullptr) {
+    return device_data(handle, 0);
+}
+
+void* MaterializedArtifact::device_data(ObjectHandle handle, std::size_t rank) const {
+    if (handle.index >= objects_.size() || rank >= objects_[handle.index].device.size() ||
+        objects_[handle.index].device[rank] == nullptr) {
         throw ArtifactError("object handle does not name a materialized tensor");
     }
-    return objects_[handle.index].device;
+    return objects_[handle.index].device[rank];
+}
+
+bool MaterializedArtifact::has_device_data(ObjectHandle handle, std::size_t rank) const noexcept {
+    return handle.index < objects_.size() && rank < objects_[handle.index].device.size() &&
+           objects_[handle.index].device[rank] != nullptr;
 }
 
 std::span<const std::byte> MaterializedArtifact::resource_bytes(ObjectHandle handle) const {
@@ -91,20 +276,46 @@ std::vector<std::byte> MaterializedArtifact::take_resource_bytes(ObjectHandle ha
 }
 
 DeviceArena& MaterializedArtifact::device_arena() {
-    if (!device_arena_) { throw ArtifactError("artifact has no device tensor backing"); }
-    return *device_arena_;
+    return device_arena(0);
+}
+
+DeviceArena& MaterializedArtifact::device_arena(std::size_t rank) {
+    if (rank >= device_arenas_.size() || !device_arenas_[rank]) {
+        throw ArtifactError("artifact has no device tensor backing for requested rank");
+    }
+    return *device_arenas_[rank];
 }
 
 MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan& plan,
                                  DeviceContext& device, LoadProgress* progress) {
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
-    const std::uint64_t capacity = plan.device_capacity_bytes;
-    if (capacity == 0 || capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
+    const std::uint64_t final_primary_capacity = plan.device_capacity_bytes;
+    const std::uint64_t source_capacity        = plan.source_device_capacity_bytes == 0
+                                                     ? final_primary_capacity
+                                                     : plan.source_device_capacity_bytes;
+    if (source_capacity == 0 || source_capacity > static_cast<std::uint64_t>(SIZE_MAX) ||
+        final_primary_capacity == 0 ||
+        final_primary_capacity > static_cast<std::uint64_t>(SIZE_MAX)) {
         throw ArtifactError("artifact tensor backing size is invalid");
     }
-    out.device_arena_ = std::make_unique<DeviceArena>(static_cast<std::size_t>(capacity));
-    out.stats_.device_capacity_bytes = capacity;
+    if (!plan.row_split_shards.empty() && !device.model_parallel()) {
+        throw ArtifactError("cross-device weight shards require two CUDA devices");
+    }
+    out.device_arenas_.push_back(
+        std::make_unique<DeviceArena>(static_cast<std::size_t>(source_capacity)));
+    out.device_arena_devices_.push_back(device.device_ids()[0]);
+    if (device.model_parallel() && plan.row_split_shards.empty()) {
+        ScopedDeviceRank secondary(device, 1);
+        out.device_arenas_.push_back(
+            std::make_unique<DeviceArena>(static_cast<std::size_t>(source_capacity)));
+        out.device_arena_devices_.push_back(device.device);
+    }
+    out.stats_.device_capacity_bytes = final_primary_capacity;
+    out.stats_.secondary_device_capacity_bytes =
+        plan.row_split_shards.empty() && device.model_parallel()
+            ? source_capacity
+            : plan.secondary_device_capacity_bytes;
     out.stats_.tensor_count          = plan.device_objects.size();
     out.stats_.resource_count        = plan.host_objects.size();
 
@@ -124,16 +335,29 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     std::uint64_t total          = 0;
     for (const DeviceMaterialization& placement : plan.device_objects) {
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
-        DeviceSpan storage =
-            out.device_arena_->alloc_bytes(static_cast<std::size_t>(placement.bytes),
-                                           static_cast<std::size_t>(placement.alignment));
+        DeviceSpan storage = out.device_arena().alloc_bytes(
+            static_cast<std::size_t>(placement.bytes),
+            static_cast<std::size_t>(placement.alignment));
         const auto actual_offset =
             static_cast<std::uint64_t>(static_cast<std::byte*>(storage.data) -
-                                       static_cast<std::byte*>(out.device_arena_->base()));
+                                       static_cast<std::byte*>(out.device_arena().base()));
         if (actual_offset != placement.offset || payload.data.size() != placement.bytes) {
             throw ArtifactError("materialization plan does not match artifact payload");
         }
-        out.objects_.at(placement.object.index).device = storage.data;
+        out.objects_.at(placement.object.index).device[0] = storage.data;
+        for (std::size_t rank = 1; rank < out.device_arena_count(); ++rank) {
+            DeviceArena& replica             = out.device_arena(rank);
+            const DeviceSpan replica_storage = replica.alloc_bytes(
+                static_cast<std::size_t>(placement.bytes),
+                static_cast<std::size_t>(placement.alignment));
+            const auto replica_offset =
+                static_cast<std::uint64_t>(static_cast<std::byte*>(replica_storage.data) -
+                                           static_cast<std::byte*>(replica.base()));
+            if (replica_offset != placement.offset) {
+                throw ArtifactError("replica materialization layout does not match primary");
+            }
+            out.objects_.at(placement.object.index).device[rank] = replica_storage.data;
+        }
         ranges.push_back(CopyRange{
             .source_begin = payload.absolute_offset,
             .source_end   = checked_add(payload.absolute_offset, placement.bytes,
@@ -251,6 +475,89 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     out.stats_.h2d_bytes = copied;
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    if (device.model_parallel() && plan.row_split_shards.empty()) {
+        // Replicate the immutable packed tensor arena once over the peer link. Each graph shard then
+        // reads ordinary device-local VRAM; only activations and partial reductions cross NVLink at
+        // inference time.
+        const int primary_device   = device.device_ids()[0];
+        const int secondary_device = device.device_ids()[1];
+        {
+            ScopedDeviceRank secondary(device, 1);
+            CUDA_CHECK(cudaMemcpyPeerAsync(
+                out.device_arena(1).base(), secondary_device, out.device_arena().base(),
+                primary_device, static_cast<std::size_t>(source_capacity), device.stream));
+            device.synchronize_rank(1);
+        }
+        out.stats_.peer_to_peer_bytes = source_capacity;
+    } else if (device.model_parallel()) {
+        if (plan.secondary_device_capacity_bytes == 0 ||
+            plan.secondary_device_capacity_bytes > static_cast<std::uint64_t>(SIZE_MAX)) {
+            throw ArtifactError("secondary shard backing size is invalid");
+        }
+
+        const int primary_device   = device.device_ids()[0];
+        const int secondary_device = device.device_ids()[1];
+        MaterializedArtifact primary_staging;
+        {
+            ScopedDeviceRank secondary(device, 1);
+            primary_staging.device_arenas_.push_back(
+                std::make_unique<DeviceArena>(static_cast<std::size_t>(final_primary_capacity)));
+            primary_staging.device_arena_devices_.push_back(secondary_device);
+            out.device_arenas_.push_back(std::make_unique<DeviceArena>(
+                static_cast<std::size_t>(plan.secondary_device_capacity_bytes)));
+            out.device_arena_devices_.push_back(secondary_device);
+
+            for (const DeviceMaterialization& placement : plan.device_objects) {
+                const DeviceSpan primary_storage = allocate_planned(
+                    primary_staging.device_arena(), placement.primary_offset,
+                    placement.primary_bytes, placement.alignment, "primary shard");
+                const RowSplitShardMaterialization* shard =
+                    find_row_split_shard(plan, placement.object);
+                if (shard == nullptr) {
+                    CUDA_CHECK(cudaMemcpyPeerAsync(
+                        primary_storage.data, secondary_device,
+                        out.objects_.at(placement.object.index).device[0], primary_device,
+                        static_cast<std::size_t>(placement.bytes), device.stream));
+                    out.stats_.peer_to_peer_bytes = checked_add(
+                        out.stats_.peer_to_peer_bytes, placement.bytes,
+                        "peer copied byte count overflows u64");
+                    continue;
+                }
+
+                const DeviceSpan secondary_storage = allocate_planned(
+                    out.device_arena(1), shard->secondary_offset, shard->secondary_bytes,
+                    placement.alignment, "secondary shard");
+                out.objects_.at(placement.object.index).device[1] = secondary_storage.data;
+                copy_row_split_shard(
+                    reader, *shard, out.objects_.at(placement.object.index).device[0],
+                    primary_storage.data, secondary_storage.data, primary_device,
+                    secondary_device, device.stream, placement.primary_bytes,
+                    shard->secondary_bytes, out.stats_.peer_to_peer_bytes);
+            }
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+        }
+
+        {
+            ScopedDeviceRank primary(device, 0);
+            out.device_arenas_[0].reset();
+            out.device_arenas_[0] =
+                std::make_unique<DeviceArena>(static_cast<std::size_t>(final_primary_capacity));
+            for (const DeviceMaterialization& placement : plan.device_objects) {
+                const DeviceSpan primary_storage = allocate_planned(
+                    out.device_arena(), placement.primary_offset, placement.primary_bytes,
+                    placement.alignment, "final primary shard");
+                out.objects_.at(placement.object.index).device[0] = primary_storage.data;
+            }
+            CUDA_CHECK(cudaMemcpyPeerAsync(
+                out.device_arena().base(), primary_device,
+                primary_staging.device_arena().base(), secondary_device,
+                static_cast<std::size_t>(final_primary_capacity), device.stream));
+            device.synchronize_rank(0);
+            out.stats_.peer_to_peer_bytes = checked_add(
+                out.stats_.peer_to_peer_bytes, final_primary_capacity,
+                "peer copied byte count overflows u64");
+        }
+    }
     if (progress != nullptr && progress->callback) { progress->callback("weights", copied, total); }
     return out;
 }

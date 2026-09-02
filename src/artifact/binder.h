@@ -21,9 +21,24 @@ struct ObjectHandle {
 
 struct DeviceMaterialization {
     ObjectHandle object;
-    std::uint64_t offset    = 0;
-    std::uint64_t bytes     = 0;
-    std::uint64_t alignment = 0;
+    std::uint64_t offset         = 0;
+    std::uint64_t bytes          = 0;
+    std::uint64_t alignment      = 0;
+    std::uint64_t primary_offset = 0;
+    std::uint64_t primary_bytes  = 0;
+};
+
+enum class RowSplitShardAxis : std::uint8_t {
+    PairedRows,
+    Columns,
+};
+
+struct RowSplitShardMaterialization {
+    ObjectHandle object;
+    RowSplitShardAxis axis          = RowSplitShardAxis::Columns;
+    std::uint64_t split             = 0;
+    std::uint64_t secondary_offset = 0;
+    std::uint64_t secondary_bytes  = 0;
 };
 
 struct HostMaterialization {
@@ -31,9 +46,12 @@ struct HostMaterialization {
 };
 
 struct MaterializationPlan {
-    std::size_t object_count            = 0;
-    std::uint64_t device_capacity_bytes = 0;
+    std::size_t object_count                     = 0;
+    std::uint64_t device_capacity_bytes          = 0;
+    std::uint64_t source_device_capacity_bytes    = 0;
+    std::uint64_t secondary_device_capacity_bytes = 0;
     std::vector<DeviceMaterialization> device_objects;
+    std::vector<RowSplitShardMaterialization> row_split_shards;
     std::vector<HostMaterialization> host_objects;
 };
 
@@ -48,6 +66,8 @@ public:
     const ObjectDescriptor& descriptor(ObjectHandle handle) const;
     PayloadSpan payload(ObjectHandle handle) const;
     void materialize_on_device(ObjectHandle handle);
+    void shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAxis axis,
+                                        std::uint64_t split);
     void retain_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     MaterializationPlan finish();
