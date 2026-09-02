@@ -38,6 +38,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <utility>
 #include <vector>
 
@@ -821,6 +822,16 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
 
+    if constexpr (Variant::supports_graph_parallel) {
+        // NVLink tensor-parallel attention: split this layer's heads across both cards. Only taken
+        // when the secondary KV pool + sharded projection were installed (tp_attention); otherwise
+        // the single-card path below runs unchanged.
+        if (graph_parallel_active() && secondary_batch_text_kv_ != nullptr) {
+            attn_mix_graph(w, *w.projection, x, fidx, ph);
+            return;
+        }
+    }
+
     const auto projection = workspace_recipe::text_attention_projection<TextConfig>(work_, T);
     Tensor h              = projection.hidden;
     ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, s);
@@ -1048,6 +1059,177 @@ void TextContext::post_mixer_graph(const Tensor& hidden, const Payload& payload,
     CUDA_CHECK(cudaMemcpyPeerAsync(peer_partial.data, primary_device, secondary_partial.data,
                                    secondary_device, peer_partial.bytes(), primary_stream));
     ops::residual_add_two(primary_partial, peer_partial, residual, primary_stream);
+}
+
+template <class Payload, class V>
+void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Tensor& x, int fidx,
+                                 Phase ph) {
+    // Each card takes exactly half the query and KV heads; the gather that reassembles a_full and the
+    // GQA group split both rely on an even head count on both.
+    static_assert(TextConfig::query_heads % 2 == 0 && TextConfig::kv_heads % 2 == 0,
+                  "tensor-parallel attention requires even query and KV head counts");
+    // The tensor-parallel path only handles the split (two-weight, head-splittable) projection form.
+    const auto* split = std::get_if<0>(&payload);
+    if (split == nullptr) {
+        throw std::logic_error("tensor-parallel attention requires a split attention projection");
+    }
+    const std::int32_t T           = x.ne[1];
+    const std::int32_t hd          = kCfg.head_dim;
+    const std::int32_t n_q_half    = kCfg.n_q / 2;
+    const std::int32_t n_kv_half   = kCfg.n_kv / 2;
+    const std::int32_t q_half_rows = n_q_half * hd;
+    const std::int32_t kv_half_rows = n_kv_half * hd;
+    const std::int32_t shard_rows  = q_half_rows + kv_half_rows;
+
+    cudaStream_t primary_stream   = ctx_.stream_for_rank(0);
+    cudaStream_t secondary_stream = ctx_.stream_for_rank(1);
+    cudaEvent_t primary_ready     = ctx_.fence_for_rank(0);
+    cudaEvent_t secondary_ready   = ctx_.fence_for_rank(1);
+    const int primary_device      = ctx_.device_ids()[0];
+    const int secondary_device    = ctx_.device_ids()[1];
+
+    const Tensor& cache_positions =
+        active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
+    const Tensor& rope_positions =
+        active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
+    const Tensor& kv_table_rows =
+        active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+
+    // Extract one contiguous row band [row_start, row_start+rows) of a packed [shard_rows,T] GEMM
+    // output into a fresh contiguous [rows,T] tensor. The graph-shard projection packs q|k (and
+    // gate|v) so their per-column blocks are interleaved by the parent stride; the attention ops
+    // require contiguity, hence this strided 2-D unpack.
+    const auto unpack = [](Tensor& dst, const Tensor& packed, std::int32_t row_start,
+                           std::int32_t rows, cudaStream_t stream) {
+        const std::size_t esz = static_cast<std::size_t>(packed.bytes() / packed.numel());
+        const auto* src       = static_cast<const unsigned char*>(packed.data) +
+                          static_cast<std::size_t>(row_start) * esz;
+        CUDA_CHECK(cudaMemcpy2DAsync(dst.data, static_cast<std::size_t>(rows) * esz, src,
+                                     static_cast<std::size_t>(packed.ne[0]) * esz,
+                                     static_cast<std::size_t>(rows) * esz,
+                                     static_cast<std::size_t>(packed.ne[1]),
+                                     cudaMemcpyDeviceToDevice, stream));
+    };
+    // Place a contiguous [rows,T] half into the row band starting at row_start of a [q_size,T] gather
+    // buffer (a strided 2-D scatter -- the inverse of unpack).
+    const auto scatter = [](Tensor& full, const Tensor& part, std::int32_t row_start,
+                            cudaStream_t stream) {
+        const std::size_t esz = static_cast<std::size_t>(part.bytes() / part.numel());
+        auto* dst = static_cast<unsigned char*>(full.data) + static_cast<std::size_t>(row_start) * esz;
+        CUDA_CHECK(cudaMemcpy2DAsync(dst, static_cast<std::size_t>(full.ne[0]) * esz, part.data,
+                                     static_cast<std::size_t>(part.ne[0]) * esz,
+                                     static_cast<std::size_t>(part.ne[0]) * esz,
+                                     static_cast<std::size_t>(part.ne[1]), cudaMemcpyDeviceToDevice,
+                                     stream));
+    };
+    // Duplicate a small primary (device 0) tensor into the rank-1 arena so the secondary card can
+    // read it locally. Only used for norms + position/index tensors; the hidden state uses the same
+    // pattern inline. Sources are contiguous, so a dense peer copy preserves the logical shape.
+    const auto peer_dup = [&](WorkspaceArena& W, const Tensor& src, cudaStream_t stream) -> Tensor {
+        Tensor dst = src.ne[1] > 1 ? W.alloc(src.dtype, {src.ne[0], src.ne[1]})
+                                   : W.alloc(src.dtype, {src.ne[0]});
+        CUDA_CHECK(cudaMemcpyPeerAsync(dst.data, secondary_device, src.data, primary_device,
+                                       src.bytes(), stream));
+        return dst;
+    };
+
+    // One card's contribution: project its head shard, normalize + rope, attend its local KV half,
+    // gate, and write the gated [q_half_rows,T] attention output. Weights/pool/positions/arena/stream
+    // are all this card's; the two invocations are otherwise identical.
+    const auto compute_half = [&](cudaStream_t stream, WorkspaceArena& W, const Weight& qk_w,
+                                  const Weight& gv_w, const ninfer::PagedKVBatchLayerView& kv_view,
+                                  const Tensor& h_in, const Tensor& qnorm_w, const Tensor& knorm_w,
+                                  const Tensor& cache_pos, const Tensor& rope_pos,
+                                  const Tensor& kv_rows, const Tensor& valid_cols, Tensor& a_half) {
+        Tensor qk = W.alloc(DType::BF16, {shard_rows, T});
+        Tensor gv = W.alloc(DType::BF16, {shard_rows, T});
+        ops::attn_input_proj_graph_shard(h_in, qk_w, gv_w, qk, gv, W, stream);
+        Tensor q    = W.alloc(DType::BF16, {q_half_rows, T});
+        Tensor k    = W.alloc(DType::BF16, {kv_half_rows, T});
+        Tensor gate = W.alloc(DType::BF16, {q_half_rows, T});
+        Tensor v    = W.alloc(DType::BF16, {kv_half_rows, T});
+        unpack(q, qk, 0, q_half_rows, stream);
+        unpack(k, qk, q_half_rows, kv_half_rows, stream);
+        unpack(gate, gv, 0, q_half_rows, stream);
+        unpack(v, gv, q_half_rows, kv_half_rows, stream);
+        Tensor qn  = W.alloc(DType::BF16, {q_half_rows, T});
+        Tensor kn  = W.alloc(DType::BF16, {kv_half_rows, T});
+        Tensor q3  = q.view({hd, n_q_half, T});
+        Tensor k3  = k.view({hd, n_kv_half, T});
+        Tensor qn3 = qn.view({hd, n_q_half, T});
+        Tensor kn3 = kn.view({hd, n_kv_half, T});
+        ops::rmsnorm(q3, qnorm_w, kCfg.rms_eps, true, qn3, stream);
+        ops::rmsnorm(k3, knorm_w, kCfg.rms_eps, true, kn3, stream);
+        Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_pos.view({T}) : rope_pos;
+        ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn3, kn3, stream);
+        Tensor a3 = a_half.view({hd, n_q_half, T});
+        Tensor v3 = v.view({hd, n_kv_half, T});
+        if (active_sequence_batch_ != 0) {
+            const std::int32_t width = active_sequence_width_;
+            Tensor q_batch = qn.view({hd, n_q_half, width, active_sequence_batch_});
+            Tensor k_batch = kn.view({hd, n_kv_half, width, active_sequence_batch_});
+            Tensor v_batch = v.view({hd, n_kv_half, width, active_sequence_batch_});
+            Tensor a_batch = a_half.view({hd, n_q_half, width, active_sequence_batch_});
+            Tensor position_batch = cache_pos.view({width, active_sequence_batch_});
+            ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid_cols,
+                                          kv_rows, {hd, n_q_half, n_kv_half}, kAttnScale, kv_view,
+                                          *active_causal_attention_envelope_, W, a_batch, stream);
+        } else {
+            ops::causal_softmax_attention(qn3, kn3, v3, cache_pos, Tensor{}, kv_rows,
+                                          {hd, n_q_half, n_kv_half}, kAttnScale, kv_view,
+                                          *active_causal_attention_envelope_, W, a3, stream);
+        }
+        ops::sigmoid_mul(gate.view({hd, n_q_half, T}), a3, stream);
+    };
+
+    // Primary hidden + the gather buffer for both head halves live in the primary mixer scope.
+    Tensor h = work_.alloc(DType::BF16, {kCfg.hidden, T});
+    ops::rmsnorm(x, *w.input_norm, kCfg.rms_eps, true, h, primary_stream);
+    Tensor a_full    = work_.alloc(DType::BF16, {kCfg.q_size, T});
+    Tensor a_primary = work_.alloc(DType::BF16, {q_half_rows, T});
+
+    // Publish the normalized hidden, then run the primary half so it overlaps the secondary card.
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    compute_half(primary_stream, work_, split->query_key, split->gate_value,
+                 batch_text_kv_->batch_layer_view(fidx), h, *w.q_norm, *w.k_norm, cache_positions,
+                 rope_positions, kv_table_rows, valid, a_primary);
+    scatter(a_full, a_primary, 0, primary_stream);
+
+    // Keep the secondary scope open across the copy-back so the secondary output stays reserved.
+    auto secondary_scope = secondary_work_->scope();
+    Tensor secondary_a;
+    {
+        ScopedDeviceRank secondary(ctx_, 1);
+        CUDA_CHECK(cudaStreamWaitEvent(secondary_stream, primary_ready, 0));
+        Tensor h_d1     = peer_dup(*secondary_work_, h, secondary_stream);
+        Tensor qnorm_d1 = peer_dup(*secondary_work_, *w.q_norm, secondary_stream);
+        Tensor knorm_d1 = peer_dup(*secondary_work_, *w.k_norm, secondary_stream);
+        Tensor cache_d1 = peer_dup(*secondary_work_, cache_positions, secondary_stream);
+        Tensor rope_d1  = peer_dup(*secondary_work_, rope_positions, secondary_stream);
+        Tensor rows_d1  = peer_dup(*secondary_work_, kv_table_rows, secondary_stream);
+        Tensor valid_d1 =
+            valid.data != nullptr ? peer_dup(*secondary_work_, valid, secondary_stream) : Tensor{};
+        // Mirror the primary block table into the secondary pool's execution matrix so both pools
+        // address identical physical slots (same layout + capacity => same matrix shape).
+        ninfer::PagedKVBatchLayerView sec_view = secondary_batch_text_kv_->batch_layer_view(fidx);
+        const Tensor primary_bt = batch_text_kv_->batch_layer_view(fidx).block_tables;
+        CUDA_CHECK(cudaMemcpyPeerAsync(sec_view.block_tables.data, secondary_device, primary_bt.data,
+                                       primary_device, primary_bt.bytes(), secondary_stream));
+        secondary_a = secondary_work_->alloc(DType::BF16, {q_half_rows, T});
+        compute_half(secondary_stream, *secondary_work_, split->secondary_query_key,
+                     split->secondary_gate_value, sec_view, h_d1, qnorm_d1, knorm_d1, cache_d1,
+                     rope_d1, rows_d1, valid_d1, secondary_a);
+        CUDA_CHECK(cudaEventRecord(secondary_ready, secondary_stream));
+    }
+    // Back on the primary: pull the secondary half over NVLink into the gather buffer, then run the
+    // full (unsharded) output projection on both halves and add into the residual.
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+    Tensor a_peer = work_.alloc(DType::BF16, {q_half_rows, T});
+    CUDA_CHECK(cudaMemcpyPeerAsync(a_peer.data, primary_device, secondary_a.data, secondary_device,
+                                   a_peer.bytes(), primary_stream));
+    scatter(a_full, a_peer, q_half_rows, primary_stream);
+    V::attention_output_projection(a_full, *w.o_proj, x, ph, work_, primary_stream);
 }
 
 template <class Tap>
