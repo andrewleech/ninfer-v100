@@ -146,6 +146,114 @@ void copy_row_split_region(std::byte* destination, const RowSplitGeometry& desti
     }
 }
 
+// Host-source counterpart of copy_row_split_region: the same 2D per-plane geometry, but the source
+// is the mmap'd artifact in host memory, so it uses cudaMemcpy2DAsync (host->device) rather than a
+// peer copy. Used by the fit-friendly shard load, which never stages the full tensor on a device.
+void copy_row_split_region_host(std::byte* destination,
+                                const RowSplitGeometry& destination_geometry,
+                                std::uint64_t destination_row, const std::byte* source,
+                                const RowSplitGeometry& source_geometry, std::uint64_t source_row,
+                                std::uint64_t source_group, std::uint64_t rows,
+                                std::uint64_t groups, cudaStream_t stream,
+                                std::uint64_t& copied_bytes) {
+    struct Plane {
+        std::uint64_t source_offset;
+        std::uint64_t destination_offset;
+        std::uint64_t bytes_per_group;
+    };
+    const std::array planes = {
+        Plane{0, 0, source_geometry.low_bytes_per_group},
+        Plane{source_geometry.high_plane_offset, destination_geometry.high_plane_offset,
+              source_geometry.high_bytes_per_group},
+        Plane{source_geometry.scale_plane_offset, destination_geometry.scale_plane_offset, 2},
+    };
+    for (const Plane& plane : planes) {
+        if (plane.bytes_per_group == 0) { continue; }
+        const std::uint64_t source_pitch = source_geometry.groups_per_row * plane.bytes_per_group;
+        const std::uint64_t destination_pitch =
+            destination_geometry.groups_per_row * plane.bytes_per_group;
+        const std::uint64_t width = groups * plane.bytes_per_group;
+        if (width == 0 || rows == 0 || width > source_pitch || width > destination_pitch) {
+            throw ArtifactError("row-split host copy has invalid pitch geometry");
+        }
+        const std::uint64_t source_offset =
+            plane.source_offset + source_row * source_pitch + source_group * plane.bytes_per_group;
+        const std::uint64_t destination_offset =
+            plane.destination_offset + destination_row * destination_pitch;
+        CUDA_CHECK(cudaMemcpy2DAsync(destination + destination_offset,
+                                     static_cast<std::size_t>(destination_pitch),
+                                     source + source_offset,
+                                     static_cast<std::size_t>(source_pitch),
+                                     static_cast<std::size_t>(width),
+                                     static_cast<std::size_t>(rows), cudaMemcpyHostToDevice,
+                                     stream));
+        copied_bytes = checked_add(copied_bytes, width * rows,
+                                   "host copied byte count overflows u64");
+    }
+}
+
+// Host-source counterpart of copy_row_split_shard: split one packed tensor from the mmap'd artifact
+// directly into this card's primary shard (device 0) and the peer card's secondary shard (device 1)
+// without ever materializing the whole tensor on a single device.
+void copy_row_split_shard_from_host(const Reader& reader,
+                                    const RowSplitShardMaterialization& shard,
+                                    const std::byte* source, void* primary_storage,
+                                    void* secondary_storage, cudaStream_t stream,
+                                    std::uint64_t primary_bytes, std::uint64_t secondary_bytes,
+                                    std::uint64_t& copied_bytes) {
+    const auto* tensor =
+        std::get_if<TensorDescriptor>(&reader.objects().at(shard.object.index));
+    if (tensor == nullptr || tensor->layout != StorageLayout::RowSplitK128V1 ||
+        tensor->shape.size() != 2) {
+        throw ArtifactError("cross-device shard does not describe a row-split tensor");
+    }
+    const RowSplitGeometry source_geometry = row_split_geometry(tensor->format, tensor->shape);
+    std::array<std::uint64_t, 2> primary_shape{};
+    std::array<std::uint64_t, 2> secondary_shape{};
+    if (shard.axis == RowSplitShardAxis::PairedRows) {
+        const std::uint64_t intermediate = tensor->shape[0] / 2;
+        primary_shape   = {2 * shard.split, tensor->shape[1]};
+        secondary_shape = {2 * (intermediate - shard.split), tensor->shape[1]};
+    } else {
+        primary_shape   = {tensor->shape[0], shard.split};
+        secondary_shape = {tensor->shape[0], tensor->shape[1] - shard.split};
+    }
+    const RowSplitGeometry primary_geometry   = row_split_geometry(tensor->format, primary_shape);
+    const RowSplitGeometry secondary_geometry = row_split_geometry(tensor->format, secondary_shape);
+    if (primary_geometry.encoded_bytes != primary_bytes ||
+        secondary_geometry.encoded_bytes != secondary_bytes) {
+        throw ArtifactError("cross-device shard bytes do not match the packed plan");
+    }
+
+    auto* primary   = static_cast<std::byte*>(primary_storage);
+    auto* secondary = static_cast<std::byte*>(secondary_storage);
+    if (shard.axis == RowSplitShardAxis::PairedRows) {
+        const std::uint64_t intermediate  = tensor->shape[0] / 2;
+        const std::uint64_t secondary_rows = intermediate - shard.split;
+        copy_row_split_region_host(primary, primary_geometry, 0, source, source_geometry, 0, 0,
+                                   shard.split, source_geometry.groups_per_row, stream,
+                                   copied_bytes);
+        copy_row_split_region_host(primary, primary_geometry, shard.split, source, source_geometry,
+                                   intermediate, 0, shard.split, source_geometry.groups_per_row,
+                                   stream, copied_bytes);
+        copy_row_split_region_host(secondary, secondary_geometry, 0, source, source_geometry,
+                                   shard.split, 0, secondary_rows, source_geometry.groups_per_row,
+                                   stream, copied_bytes);
+        copy_row_split_region_host(secondary, secondary_geometry, secondary_rows, source,
+                                   source_geometry, intermediate + shard.split, 0, secondary_rows,
+                                   source_geometry.groups_per_row, stream, copied_bytes);
+        return;
+    }
+
+    const std::uint64_t primary_groups   = primary_geometry.groups_per_row;
+    const std::uint64_t secondary_groups = secondary_geometry.groups_per_row;
+    copy_row_split_region_host(primary, primary_geometry, 0, source, source_geometry, 0, 0,
+                               source_geometry.rows, primary_groups, stream, copied_bytes);
+    copy_row_split_region_host(secondary, secondary_geometry, 0, source, source_geometry, 0,
+                               primary_groups, source_geometry.rows, secondary_groups, stream,
+                               copied_bytes);
+}
+
 void copy_row_split_shard(const Reader& reader, const RowSplitShardMaterialization& shard,
                           const void* source_storage, void* primary_storage,
                           void* secondary_storage, int primary_device, int secondary_device,
@@ -301,6 +409,93 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
     }
     if (!plan.row_split_shards.empty() && !device.model_parallel()) {
         throw ArtifactError("cross-device weight shards require two CUDA devices");
+    }
+    if (device.model_parallel() && !plan.row_split_shards.empty()) {
+        // Fit-friendly cross-device shard load. Read each tensor from the mmap'd artifact and copy
+        // its primary rows straight to the device-0 arena and its secondary rows straight to the
+        // device-1 arena. Unlike the dense-replica path below, the full model is never staged on a
+        // single card, so peak VRAM per card is just that card's shard -- required to fit the 27B
+        // across 2x16 GB V100s (staging the 15.9 GB source on one card OOMs there).
+        if (plan.secondary_device_capacity_bytes == 0 ||
+            plan.secondary_device_capacity_bytes > static_cast<std::uint64_t>(SIZE_MAX)) {
+            throw ArtifactError("secondary shard backing size is invalid");
+        }
+        out.device_arenas_.push_back(
+            std::make_unique<DeviceArena>(static_cast<std::size_t>(final_primary_capacity)));
+        out.device_arena_devices_.push_back(device.device_ids()[0]);
+        {
+            ScopedDeviceRank secondary(device, 1);
+            out.device_arenas_.push_back(std::make_unique<DeviceArena>(
+                static_cast<std::size_t>(plan.secondary_device_capacity_bytes)));
+            out.device_arena_devices_.push_back(device.device);
+        }
+        out.stats_.device_capacity_bytes           = final_primary_capacity;
+        out.stats_.secondary_device_capacity_bytes = plan.secondary_device_capacity_bytes;
+        out.stats_.tensor_count                    = plan.device_objects.size();
+        out.stats_.resource_count                  = plan.host_objects.size();
+
+        for (const HostMaterialization& placement : plan.host_objects) {
+            auto& resource            = out.objects_.at(placement.object.index).resource;
+            const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+            resource.assign(payload.data.begin(), payload.data.end());
+            out.stats_.retained_resource_bytes += resource.size();
+            out.stats_.file_bytes = checked_add(out.stats_.file_bytes, resource.size(),
+                                                "artifact read bytes overflow u64");
+        }
+
+        std::uint64_t total = 0;
+        for (const DeviceMaterialization& placement : plan.device_objects) {
+            total = checked_add(total, placement.bytes, "artifact tensor byte count overflows u64");
+        }
+        if (plan.device_objects.empty()) {
+            throw ArtifactError("materialization plan has no device tensors");
+        }
+        std::uint64_t copied         = 0;
+        std::uint64_t last_published = 0;
+        const auto start             = std::chrono::steady_clock::now();
+        if (progress != nullptr && progress->callback) { progress->callback("weights", 0, total); }
+        for (const DeviceMaterialization& placement : plan.device_objects) {
+            const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
+            const DeviceSpan primary_storage =
+                allocate_planned(out.device_arena(0), placement.primary_offset,
+                                 placement.primary_bytes, placement.alignment, "primary shard");
+            out.objects_.at(placement.object.index).device[0] = primary_storage.data;
+            const RowSplitShardMaterialization* shard = find_row_split_shard(plan, placement.object);
+            if (shard == nullptr) {
+                if (payload.data.size() != placement.bytes ||
+                    placement.primary_bytes != placement.bytes) {
+                    throw ArtifactError("materialization plan does not match artifact payload");
+                }
+                CUDA_CHECK(cudaMemcpyAsync(primary_storage.data, payload.data.data(),
+                                           static_cast<std::size_t>(placement.bytes),
+                                           cudaMemcpyHostToDevice, device.transfer_stream));
+            } else {
+                const DeviceSpan secondary_storage =
+                    allocate_planned(out.device_arena(1), shard->secondary_offset,
+                                     shard->secondary_bytes, placement.alignment, "secondary shard");
+                out.objects_.at(placement.object.index).device[1] = secondary_storage.data;
+                copy_row_split_shard_from_host(reader, *shard, payload.data.data(),
+                                               primary_storage.data, secondary_storage.data,
+                                               device.transfer_stream, placement.primary_bytes,
+                                               shard->secondary_bytes, out.stats_.peer_to_peer_bytes);
+            }
+            copied = checked_add(copied, placement.bytes, "artifact copied byte count overflows u64");
+            if (progress != nullptr && progress->callback && copied != last_published &&
+                copied < total) {
+                last_published = copied;
+                progress->callback("weights", copied, total);
+            }
+        }
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        out.stats_.h2d_bytes = copied;
+        out.stats_.file_bytes =
+            checked_add(out.stats_.file_bytes, copied, "artifact read bytes overflow u64");
+        out.stats_.upload_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (progress != nullptr && progress->callback) {
+            progress->callback("weights", copied, total);
+        }
+        return out;
     }
     out.device_arenas_.push_back(
         std::make_unique<DeviceArena>(static_cast<std::size_t>(source_capacity)));
@@ -489,74 +684,6 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
             device.synchronize_rank(1);
         }
         out.stats_.peer_to_peer_bytes = source_capacity;
-    } else if (device.model_parallel()) {
-        if (plan.secondary_device_capacity_bytes == 0 ||
-            plan.secondary_device_capacity_bytes > static_cast<std::uint64_t>(SIZE_MAX)) {
-            throw ArtifactError("secondary shard backing size is invalid");
-        }
-
-        const int primary_device   = device.device_ids()[0];
-        const int secondary_device = device.device_ids()[1];
-        MaterializedArtifact primary_staging;
-        {
-            ScopedDeviceRank secondary(device, 1);
-            primary_staging.device_arenas_.push_back(
-                std::make_unique<DeviceArena>(static_cast<std::size_t>(final_primary_capacity)));
-            primary_staging.device_arena_devices_.push_back(secondary_device);
-            out.device_arenas_.push_back(std::make_unique<DeviceArena>(
-                static_cast<std::size_t>(plan.secondary_device_capacity_bytes)));
-            out.device_arena_devices_.push_back(secondary_device);
-
-            for (const DeviceMaterialization& placement : plan.device_objects) {
-                const DeviceSpan primary_storage = allocate_planned(
-                    primary_staging.device_arena(), placement.primary_offset,
-                    placement.primary_bytes, placement.alignment, "primary shard");
-                const RowSplitShardMaterialization* shard =
-                    find_row_split_shard(plan, placement.object);
-                if (shard == nullptr) {
-                    CUDA_CHECK(cudaMemcpyPeerAsync(
-                        primary_storage.data, secondary_device,
-                        out.objects_.at(placement.object.index).device[0], primary_device,
-                        static_cast<std::size_t>(placement.bytes), device.stream));
-                    out.stats_.peer_to_peer_bytes = checked_add(
-                        out.stats_.peer_to_peer_bytes, placement.bytes,
-                        "peer copied byte count overflows u64");
-                    continue;
-                }
-
-                const DeviceSpan secondary_storage = allocate_planned(
-                    out.device_arena(1), shard->secondary_offset, shard->secondary_bytes,
-                    placement.alignment, "secondary shard");
-                out.objects_.at(placement.object.index).device[1] = secondary_storage.data;
-                copy_row_split_shard(
-                    reader, *shard, out.objects_.at(placement.object.index).device[0],
-                    primary_storage.data, secondary_storage.data, primary_device,
-                    secondary_device, device.stream, placement.primary_bytes,
-                    shard->secondary_bytes, out.stats_.peer_to_peer_bytes);
-            }
-            CUDA_CHECK(cudaStreamSynchronize(device.stream));
-        }
-
-        {
-            ScopedDeviceRank primary(device, 0);
-            out.device_arenas_[0].reset();
-            out.device_arenas_[0] =
-                std::make_unique<DeviceArena>(static_cast<std::size_t>(final_primary_capacity));
-            for (const DeviceMaterialization& placement : plan.device_objects) {
-                const DeviceSpan primary_storage = allocate_planned(
-                    out.device_arena(), placement.primary_offset, placement.primary_bytes,
-                    placement.alignment, "final primary shard");
-                out.objects_.at(placement.object.index).device[0] = primary_storage.data;
-            }
-            CUDA_CHECK(cudaMemcpyPeerAsync(
-                out.device_arena().base(), primary_device,
-                primary_staging.device_arena().base(), secondary_device,
-                static_cast<std::size_t>(final_primary_capacity), device.stream));
-            device.synchronize_rank(0);
-            out.stats_.peer_to_peer_bytes = checked_add(
-                out.stats_.peer_to_peer_bytes, final_primary_capacity,
-                "peer copied byte count overflows u64");
-        }
     }
     if (progress != nullptr && progress->callback) { progress->callback("weights", copied, total); }
     return out;
