@@ -260,10 +260,11 @@ struct SmallTWorkspace {
 #ifdef NINFER_VOLTA_BUILD
 bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
                                 std::int32_t batch_size, DType cache_dtype) {
-    // 12-head (TP-attention) is deliberately excluded here so it takes the standard prompt/small_t
-    // path rather than the volta-flash fast path (which would need its own <12,2> instantiation).
+    // 24q/4kv, 16q/2kv, and 12q/2kv (NVLink TP-attention's per-card half) all take the volta-flash
+    // fast path; the 12-head prefill was otherwise ~7x slower on the standard prompt path.
     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
-                                    q_heads == CausalD256H16Kv2::QHeads;
+                                    q_heads == CausalD256H16Kv2::QHeads ||
+                                    q_heads == CausalD256H12Kv2::QHeads;
     return supported_geometry && batch_size == 1 &&
            (cache_dtype == DType::BF16 || cache_dtype == DType::I8) &&
            width >= detail::kVoltaFlashMinimumWidth;
