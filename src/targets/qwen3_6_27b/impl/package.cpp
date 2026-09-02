@@ -6,6 +6,7 @@
 #include "targets/qwen3_6_27b/impl/load/bindings.h"
 #include "targets/qwen3_6_27b/impl/variant.h"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
@@ -101,10 +102,14 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    const bool graph_parallel = options.devices.size() == 2;
+    // Opt-in tensor-parallel attention (Phase 7). Dev toggle via env for now; the MLP-only graph path
+    // stays the default. Requires the dual-device graph mode.
+    const bool tp_attention = graph_parallel && std::getenv("NINFER_TP_ATTENTION") != nullptr;
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options),
-                              options.devices.size() == 2)));
+                              graph_parallel, tp_attention)));
 }
 
 std::unique_ptr<Package::LoadedModel>

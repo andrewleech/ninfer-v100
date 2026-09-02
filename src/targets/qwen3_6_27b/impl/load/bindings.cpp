@@ -199,6 +199,22 @@ FullAttentionProjectionPayload
 load_attention_projection(const FullAttentionPlan& plan,
                           const artifact::MaterializedArtifact& materialized) {
     if (const auto* split = std::get_if<SplitAttentionProjectionPlan>(&plan.projection)) {
+        if (materialized.has_device_data(split->query_key.object, 1)) {
+            // Tensor-parallel attention: 12q/2kv per card -> [3584,5120] (q3072|k512) Q4/Q5 shards.
+            constexpr std::int32_t kShardRows = 3584;
+            return SplitAttentionProjectionPayload{
+                .query_key = materialized_weight(materialized, split->query_key.object,
+                                                 split->query_key.format, kShardRows, 5120, 0),
+                .gate_value = materialized_weight(materialized, split->gate_value.object,
+                                                  split->gate_value.format, kShardRows, 5120, 0),
+                .secondary_query_key = materialized_weight(materialized, split->query_key.object,
+                                                           split->query_key.format, kShardRows,
+                                                           5120, 1),
+                .secondary_gate_value = materialized_weight(materialized, split->gate_value.object,
+                                                            split->gate_value.format, kShardRows,
+                                                            5120, 1),
+            };
+        }
         return SplitAttentionProjectionPayload{
             .query_key  = materialized_weight(materialized, split->query_key, 7168, 5120),
             .gate_value = materialized_weight(materialized, split->gate_value, 7168, 5120),
@@ -439,7 +455,8 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 } // namespace
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features, bool graph_parallel) {
+                               qwen3_6::StartupFeatures features, bool graph_parallel,
+                               bool tp_attention) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
@@ -477,6 +494,23 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                                   kPrimaryIntermediate);
             binder.shard_row_split_across_devices(
                 layer.mlp.down.object, artifact::RowSplitShardAxis::Columns, kPrimaryIntermediate);
+        }
+    }
+    if (tp_attention) {
+        // Tensor-parallel the 16 full-attention layers: split the packed Q4 query_key [Q6144|K1024]
+        // and Q5 gate_value [gate6144|V1024] 12q/2kv per card by head (QkvHeadHalf, split = q_size).
+        // o_proj is left whole -- the two cards' attention outputs are gathered and the full o_proj
+        // runs on the primary. Requires graph_parallel (dual device). See Phase 7.
+        constexpr std::uint64_t kQuerySize = 6144;
+        for (const TextLayerPlan& layer : out.text_layers) {
+            if (!layer.is_full_attention) { continue; }
+            const auto* split =
+                std::get_if<SplitAttentionProjectionPlan>(&layer.attention.projection);
+            if (split == nullptr) { continue; }
+            binder.shard_row_split_across_devices(
+                split->query_key.object, artifact::RowSplitShardAxis::QkvHeadHalf, kQuerySize);
+            binder.shard_row_split_across_devices(
+                split->gate_value.object, artifact::RowSplitShardAxis::QkvHeadHalf, kQuerySize);
         }
     }
     out.final_norm =

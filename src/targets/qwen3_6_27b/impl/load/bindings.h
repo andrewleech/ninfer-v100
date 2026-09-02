@@ -129,7 +129,8 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features, bool graph_parallel = false);
+                               qwen3_6::StartupFeatures features, bool graph_parallel = false,
+                               bool tp_attention = false);
 
 struct DensePostMixerPayload {
     Weight gate_up;
@@ -141,6 +142,11 @@ struct DensePostMixerPayload {
 struct SplitAttentionProjectionPayload {
     Weight query_key;
     Weight gate_value;
+    // NVLink tensor-parallel attention: this card's peer holds the other 12q/2kv head half. Present
+    // only when the attention projection was sharded (QkvHeadHalf). o_proj is not sharded -- the two
+    // cards' attention outputs are gathered and the full o_proj runs on the primary.
+    Weight secondary_query_key;
+    Weight secondary_gate_value;
 };
 
 struct FusedAttentionProjectionPayload {
