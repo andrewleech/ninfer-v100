@@ -41,6 +41,26 @@ int parse_device(const char* text) {
     return static_cast<int>(value);
 }
 
+std::vector<int> parse_devices(const char* text) {
+    const std::string_view input(text == nullptr ? "" : text);
+    std::vector<int> devices;
+    std::size_t begin = 0;
+    while (begin <= input.size()) {
+        const std::size_t comma = input.find(',', begin);
+        const std::size_t end   = comma == std::string_view::npos ? input.size() : comma;
+        if (end == begin) { throw std::invalid_argument("invalid devices: " + std::string(input)); }
+        const std::string token(input.substr(begin, end - begin));
+        devices.push_back(parse_device(token.c_str()));
+        if (devices.size() > 2) {
+            throw std::invalid_argument("--devices supports exactly one or two CUDA devices");
+        }
+        if (comma == std::string_view::npos) { break; }
+        begin = comma + 1;
+    }
+    if (devices.empty()) { throw std::invalid_argument("--devices must not be empty"); }
+    return devices;
+}
+
 float parse_float(const char* text, std::string_view label, float minimum, float maximum) {
     errno              = 0;
     char* end          = nullptr;
@@ -77,7 +97,7 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
+           "       [--device N|--devices N,M]\n"
            "       [--kv-dtype bf16|int8|fp8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -109,6 +129,8 @@ Options parse_options(int argc, char** argv) {
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
     options.artifact_path     = argv[1];
     bool kv_capacity_explicit = false;
+    bool device_explicit      = false;
+    bool devices_explicit     = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -132,6 +154,10 @@ Options parse_options(int argc, char** argv) {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
             options.device = parse_device(value(arg));
+            device_explicit = true;
+        } else if (arg == "--devices") {
+            options.devices  = parse_devices(value(arg));
+            devices_explicit = true;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
@@ -197,6 +223,10 @@ Options parse_options(int argc, char** argv) {
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
     }
+    if (device_explicit && devices_explicit) {
+        throw std::invalid_argument("--device and --devices are mutually exclusive");
+    }
+    if (devices_explicit) { options.device = options.devices.front(); }
 
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();
