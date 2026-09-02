@@ -171,6 +171,12 @@ public:
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
 
+    // Enables NVLink tensor-parallel attention on this card by handing it the secondary text KV pool
+    // (kv_heads/2 heads on rank 1). Null keeps the single-pool path. See DUAL-V100-PORT-PLAN.md.
+    void set_secondary_text_kv(const qwen3_6::PagedKVCache* pool) noexcept {
+        secondary_batch_text_kv_ = pool;
+    }
+
     void set_prefill_split_frontier(std::int64_t position) noexcept {
         prefill_split_frontier_ = position;
     }
@@ -256,6 +262,14 @@ private:
     template <class Payload, class V = Variant>
     void post_mixer_graph(const Tensor& hidden, const Payload& payload, Tensor& residual,
                           int tokens);
+    // NVLink tensor-parallel attention for one full-attention layer: each card computes its 12q/2kv
+    // head half (projection shard + norms + RoPE + local GQA against its half of the KV heads), the
+    // two [q_size/2,T] outputs are gathered on the primary, and the full o_proj runs there. Templated
+    // on the payload + variant so payload.secondary_* and the split alternative are dependent names,
+    // instantiated only for graph-parallel targets (guarded by if constexpr in attn_mix).
+    template <class Payload, class V = Variant>
+    void attn_mix_graph(const FullLayerW& weights, const Payload& payload, Tensor& x, int index,
+                        Phase phase);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
@@ -307,6 +321,10 @@ private:
     qwen3_6::PagedKVCacheView mtp_kv_;
     const qwen3_6::PagedKVCache* batch_text_kv_ = nullptr;
     const qwen3_6::PagedKVCache* batch_mtp_kv_  = nullptr;
+    // NVLink tensor-parallel attention: the rank-1 text KV pool holding this card's second head half
+    // (kv_heads/2). Null unless tp_attention is active. attn_mix's graph path attends it locally on
+    // rank 1 using the primary's mirrored block table.
+    const qwen3_6::PagedKVCache* secondary_batch_text_kv_ = nullptr;
     LinearAttentionStatePool& state_;
     qwen3_6::RoundState& io_;
     Tensor& prefill_hidden_;

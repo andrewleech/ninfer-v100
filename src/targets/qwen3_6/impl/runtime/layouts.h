@@ -80,6 +80,7 @@ struct SequencePlanningInputs {
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
+    bool tp_attention   = false;
     int device          = 0;
     ContextCacheOptions context_cache;
 };
@@ -104,6 +105,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     StartupFeatures features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
+    bool tp_attention   = false;
     int device          = 0;
     ContextCacheOptions context_cache;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;

@@ -15,6 +15,7 @@
 #include "ninfer/ops/speculative_round.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -133,6 +134,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .mtp_layers                = TextConfig::mtp_layers,
                      .capacity                  = plan.capacity,
                      .kv_heads                  = TextConfig::kv_heads,
+                     // NVLink tensor-parallel attention stores half the text KV heads on each card;
+                     // the MTP cache stays at the full kv_heads. Zero means "same as kv_heads".
+                     .text_kv_heads      = plan.tp_attention ? TextConfig::kv_heads / 2 : 0,
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
@@ -678,6 +682,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->features            = inputs.features;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
+    impl->tp_attention        = inputs.tp_attention;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
     impl->kv_dtype            = inputs.kv_dtype;
@@ -740,6 +745,12 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
     validate_target_options(device, options);
     const TargetKVCacheProfile kv_profile = target_kv_cache_profile(options.kv_cache);
 
+    // Opt-in NVLink tensor-parallel attention. Matches the load-side gate in the 27b package
+    // (dual-device graph mode + the NINFER_TP_ATTENTION dev toggle); confined to variants that
+    // declare graph-parallel support so the single-card 35b path is never affected.
+    const bool tp_attention = Variant::supports_graph_parallel && options.devices.size() == 2 &&
+                              std::getenv("NINFER_TP_ATTENTION") != nullptr;
+
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,
@@ -753,6 +764,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
+        .tp_attention        = tp_attention,
         .device              = options.device,
         .context_cache       = options.context_cache,
     };

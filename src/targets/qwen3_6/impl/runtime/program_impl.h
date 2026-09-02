@@ -824,6 +824,36 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity());
+    if (device.model_parallel() && plan.tp_attention) {
+        // NVLink tensor-parallel attention: allocate the secondary card's text KV pool on rank 1. It
+        // is text-only (MTP attention is not sharded) and holds kv_heads/2 heads -- the same halving
+        // the primary pool already got from the sequence planner. Its own reservation lifecycle is
+        // never driven; the attention path mirrors the primary block table into its execution-table
+        // matrix each layer, so both pools address identical physical slots. See DUAL-V100-PORT-PLAN.
+        ScopedDeviceRank secondary(device, 1);
+        LayoutBuilder secondary_builder;
+        const qwen3_6::DecoderStateLayout secondary_layout = qwen3_6::plan_decoder_state(
+            secondary_builder,
+            qwen3_6::DecoderStateSpec{
+                .full_attention_layers     = TextConfig::full_attention_layers(),
+                .mtp_layers                = 0,
+                .capacity                  = plan.capacity,
+                .kv_heads                  = TextConfig::kv_heads / 2,
+                .text_kv_heads             = 0,
+                .attention_head_dim        = TextConfig::head_dim,
+                .kv_dtype                  = plan.kv_dtype,
+                .kv_quant_group            = plan.kv_quant_group,
+                .enable_mtp                = false,
+                .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
+                .text_physical_page_groups = plan.main_page_groups,
+                .mtp_physical_page_groups  = 0,
+            });
+        const std::size_t secondary_bytes =
+            secondary_builder.finish(256, "secondary text KV pool");
+        secondary_kv_storage.emplace(secondary_bytes);
+        secondary_decoder = std::make_unique<qwen3_6::DecoderState>(
+            DeviceSpan{secondary_kv_storage->base(), secondary_bytes}, secondary_layout);
+    }
     state_images =
         std::make_unique<qwen3_6::StateImageDevicePool>(backing, plan.persistent.state_images);
     if (plan.context_cache.host_state_slots != 0) {
@@ -983,6 +1013,10 @@ ProgramImplCore::~ProgramImplCore() noexcept {
         ScopedDeviceRank secondary(device, 1);
         secondary_work.reset();
         secondary_workspace_storage.reset();
+        // The secondary KV pool's DeviceState + arena also live on rank 1; free them here so their
+        // cudaFree runs with rank 1 active. No-ops when tensor-parallel attention was inactive.
+        secondary_decoder.reset();
+        secondary_kv_storage.reset();
     }
 }
 
@@ -1078,7 +1112,7 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
             const std::uint32_t nominal = std::min(prefill_chunk, predictor_count - cursor);
             schedule::PrefillContext schedule_state{
                 {device, model, work, state_images->linear(), nullptr, io, prefill_hidden,
-                 prefill_chunk, proposal_head, secondary_work ? &*secondary_work : nullptr},
+                 prefill_chunk, proposal_head, secondary_work ? &*secondary_work : nullptr, secondary_text_cache()},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -8505,7 +8539,7 @@ runtime::ExecutionTiming ProgramImplCore::append_forced_tokens(
                 schedule::PrefillContext schedule_state{
                     {device, model, work, state_images->linear(),
                      replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-                     proposal_head, secondary_work ? &*secondary_work : nullptr},
+                     proposal_head, secondary_work ? &*secondary_work : nullptr, secondary_text_cache()},
                     text_kv_view(sequence),
                     mtp_kv_view(sequence),
                     decoder->text_kv,
@@ -10348,7 +10382,7 @@ void ProgramImplCore::prepare_graphs() {
                                        prefill_hidden,
                                        prefill_chunk,
                                        proposal_head,
-                                       secondary_work ? &*secondary_work : nullptr};
+                                       secondary_work ? &*secondary_work : nullptr, secondary_text_cache()};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -10620,7 +10654,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     schedule::DFlashAppendContext state{{device, model, work, state_images->linear(),
                                          replay_records ? &*replay_records : nullptr, io,
-                                         prefill_hidden, prefill_chunk, proposal_head, secondary_work ? &*secondary_work : nullptr},
+                                         prefill_hidden, prefill_chunk, proposal_head, secondary_work ? &*secondary_work : nullptr, secondary_text_cache()},
                                         *dflash};
     mark_workspace_usage(workspace_plan.dflash_context);
     schedule::dflash_append_context(state, features, positions, device_counts,
@@ -10679,7 +10713,7 @@ ProgramImplCore::advance_prefill(SequenceState& sequence, RequestControl& reques
         schedule::PrefillContext schedule_state{
             {device, model, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, secondary_work ? &*secondary_work : nullptr},
+             proposal_head, secondary_work ? &*secondary_work : nullptr, secondary_text_cache()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -11004,7 +11038,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                        replay_records ? &*replay_records : nullptr,
                                                        io, prefill_hidden, prefill_chunk,
-                                                       proposal_head, secondary_work ? &*secondary_work : nullptr},
+                                                       proposal_head, secondary_work ? &*secondary_work : nullptr, secondary_text_cache()},
                                                       decoder->text_kv,
                                                       *io.ordinary,
                                                       *ordinary_host_ingress,
@@ -11163,7 +11197,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule::MtpBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                   replay_records ? &*replay_records : nullptr, io,
-                                                  prefill_hidden, prefill_chunk, proposal_head, secondary_work ? &*secondary_work : nullptr},
+                                                  prefill_hidden, prefill_chunk, proposal_head, secondary_work ? &*secondary_work : nullptr, secondary_text_cache()},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -11350,7 +11384,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         schedule::DFlashBatchContext schedule_state{{device, model, work, state_images->linear(),
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
-                                                     proposal_head, secondary_work ? &*secondary_work : nullptr},
+                                                     proposal_head, secondary_work ? &*secondary_work : nullptr, secondary_text_cache()},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,

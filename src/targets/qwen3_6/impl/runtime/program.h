@@ -645,6 +645,11 @@ public:
     // its reservation precisely; here it mirrors the primary general workspace capacity.
     std::optional<DeviceArena> secondary_workspace_storage;
     std::optional<WorkspaceArena> secondary_work;
+    // NVLink tensor-parallel attention: the secondary card's text KV pool (kv_heads/2), allocated on
+    // rank 1. Present only when tp_attention is active. Its own execution-table matrix doubles as the
+    // landing buffer for the primary block table, mirrored per attention layer. See the port plan.
+    std::optional<DeviceArena> secondary_kv_storage;
+    std::unique_ptr<qwen3_6::DecoderState> secondary_decoder;
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::unique_ptr<HostKVArena> host_kv_arena;
     std::unique_ptr<LogicalKVPageStore> text_kv_pages;
@@ -1184,6 +1189,12 @@ private:
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
     [[nodiscard]] qwen3_6::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_6::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
+    // The secondary card's text KV pool under NVLink tensor-parallel attention, or null when it is
+    // not active. Passed to each TextContext so its attn_mix graph path can attend the second head
+    // half locally on rank 1.
+    [[nodiscard]] const qwen3_6::PagedKVCache* secondary_text_cache() const noexcept {
+        return secondary_decoder ? &secondary_decoder->text_kv : nullptr;
+    }
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

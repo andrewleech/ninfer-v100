@@ -42,6 +42,10 @@ struct ExecutionCore {
     // card's MLP shard (and, in later phases, its remote-attention scratch). Trailing + defaulted so
     // existing positional aggregate initializers stay valid. See docs/DUAL-V100-PORT-PLAN.md.
     WorkspaceArena* secondary_work = nullptr;
+    // Non-null only under NVLink tensor-parallel attention: the rank-1 text KV pool (kv_heads/2)
+    // holding this half of the heads. The primary pool holds the other half; both index the same
+    // physical slots via the primary's block table. Trailing + defaulted. See DUAL-V100-PORT-PLAN.md.
+    const qwen3_6::PagedKVCache* secondary_text_kv = nullptr;
 };
 
 struct PrefillContext {

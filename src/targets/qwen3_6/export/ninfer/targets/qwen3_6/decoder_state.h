@@ -17,6 +17,9 @@ struct DecoderStateSpec {
     std::uint32_t mtp_layers                = 0;
     std::uint32_t capacity                  = 0;
     std::int32_t kv_heads                   = 0;
+    // Text-cache KV heads. Zero means "same as kv_heads". NVLink tensor-parallel attention halves
+    // this (each card stores half the heads) while the MTP cache stays at the full kv_heads.
+    std::int32_t text_kv_heads              = 0;
     std::int32_t attention_head_dim         = 0;
     DType kv_dtype                          = DType::BF16;
     std::int32_t kv_quant_group             = 0;
