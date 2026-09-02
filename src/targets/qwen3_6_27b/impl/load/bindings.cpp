@@ -33,6 +33,10 @@ inline std::int64_t mlp_primary_intermediate() {
         const long value = std::strtol(raw, nullptr, 10);
         if (value > 0 && value < 17408 && (value % 64) == 0) { return value; }
     }
+    // Under tensor-parallel attention the primary already holds the full 262K KV half, so default to
+    // a lighter MLP shard (secondary takes the rest) -- this is what lets the full 262144 context fit.
+    // Plain graph-parallel (MLP-only) keeps the balanced 8192. Override with NINFER_MLP_PRIMARY.
+    if (std::getenv("NINFER_TP_ATTENTION") != nullptr) { return 4096; }
     return 8192;
 }
 
