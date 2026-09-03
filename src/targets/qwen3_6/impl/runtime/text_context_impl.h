@@ -1278,6 +1278,32 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
+    // Env-gated per-phase decode timing (NINFER_DECODE_PROFILE): syncs the primary stream around each
+    // mixer/mlp call so the totals are serialized wall-clock per phase type. Diagnostic; off by default.
+    static const bool dprof = std::getenv("NINFER_DECODE_PROFILE") != nullptr;
+    static std::atomic<double> d_attn{0}, d_gdn{0}, d_mlp{0};
+    static std::atomic<long> d_fwd{0};
+    struct DDump {
+        ~DDump() {
+            if (d_fwd.load() > 0) {
+                std::fprintf(stderr, "[decode-prof] fwd=%ld attn=%.3f gdn=%.3f mlp=%.3f (s)\n",
+                             d_fwd.load(), d_attn.load(), d_gdn.load(), d_mlp.load());
+            }
+        }
+    };
+    static DDump ddump;
+    const auto dphase = [&](std::atomic<double>& acc, auto&& fn) {
+        if (!dprof) {
+            fn();
+            return;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+        const auto a = std::chrono::steady_clock::now();
+        fn();
+        CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+        acc.store(acc.load() + std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count());
+    };
+    if (dprof) { d_fwd.fetch_add(1); }
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
@@ -1290,14 +1316,14 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention,
                     nvtx::Category::Attention, static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                attn_mix(full, x, fidx, ph);
+                dphase(d_attn, [&] { attn_mix(full, x, fidx, ph); });
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(full.post_attn_norm, full.mlp, x, ph);
+                dphase(d_mlp, [&] { mlp_tail(full.post_attn_norm, full.mlp, x, ph); });
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         } else {
@@ -1311,14 +1337,14 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
                     prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn, nvtx::Category::Gdn,
                     static_cast<std::uint64_t>(layer));
                 auto mixer_scope = work_.scope();
-                gdn_mix(gdn, x, gidx, ph);
+                dphase(d_gdn, [&] { gdn_mix(gdn, x, gidx, ph); });
             }
             {
                 nvtx::ScopedRange post_mixer_range(
                     prefill ? nvtx::Name::PrefillPostMixer : nvtx::Name::VerifyPostMixer,
                     nvtx::Category::PostMixer, static_cast<std::uint64_t>(layer));
                 auto mlp_scope = work_.scope();
-                mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph);
+                dphase(d_mlp, [&] { mlp_tail(gdn.post_attn_norm, gdn.mlp, x, ph); });
                 if constexpr (Tap::enabled) { tap.capture_layer(layer, x, ctx_.stream); }
             }
         }
