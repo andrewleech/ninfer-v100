@@ -2,25 +2,25 @@
 
 // Q4G64 RowSplit x BF16 GEMM via int8 __dp4a on Volta (sm_70), wide-T prefill.
 //
-// Phase-1 prototype of the "different algorithm" the fair-comparison against llama.cpp pointed to.
-// llama's titan build forces MMQ, so its prefill GEMM is int8 dp4a: activations are quantised to
-// int8 (Q8_1-style, per-block fp16 scale) ONCE, Q4 weights are used as int8 (each nibble is
-// already a signed [-8,7] code), the inner product runs on __dp4a (4 int8 MACs/instr) with an
-// int32 accumulator, and the group scales are applied in the epilogue. ncu on the V100 showed
-// llama's dp4a kernel is COMPUTE-bound (~75% FMA/int pipe, L1/TEX ~30%), whereas this port's
-// fp16 mma.sync kernel (q4_volta_mma_gemm.cuh) is L1/shared-bound (84.6%, compute 46%). The point
-// of this kernel is to move the bottleneck off L1 onto the integer pipe the same way.
+// The int8/dp4a route the Phase-0 fair-comparison against llama.cpp pointed to. llama's titan build
+// forces MMQ, so its prefill GEMM is int8 dp4a and ncu shows it COMPUTE-bound (~75% FMA/int pipe,
+// L1 ~30%), whereas ninfer's fp16 mma.sync q4_volta kernel is L1/shared-bound (84.6%, compute 46%).
 //
-// Two kernels, mirroring llama's (quantize_mmq_q8_1 + mul_mat_q):
-//   1. q4_dp4a_quantize_x_kernel -- quantise the whole activation matrix to int8 ONCE into a
-//      scratch buffer (int8 xq[t][k] + fp16 xs[t][groups]). The first prototype re-quantised
-//      inside every N-tile (n/64 times redundant); hoisting this is the dominant speedup.
-//   2. q4_volta_dp4a_gemm_kernel -- the dp4a GEMM proper, reading pre-quantised int8 activations.
+// The decisive structure copied from llama's mmq.cuh vec_dot: WARP-COOPERATIVE tiling. Within a
+// warp, threadIdx.x (lane) selects the output ROW and threadIdx.y (warp) selects the output TOKEN.
+// So the activation operand y[token][k] is identical across the warp's 32 lanes -- a SHARED
+// BROADCAST, one transaction feeding all 32 lanes -- while the weight operand x[row][k] is distinct
+// per lane and made bank-conflict-free by an odd (17-word) row stride. That turns ~1:50 dp4a per
+// shared transaction, versus ~1:4 for an independent per-thread output tile, which is exactly why
+// llama saturates the integer pipe where a naive dp4a GEMM stays L1-bound.
 //
-// Weight layout (Q4RowSplitStorage): row-major, K/64 groups/row, each group = 32 code bytes
-// (byte b holds K=2b low nibble, K=2b+1 high nibble) + one fp16 scale. int8 weight = ((nibble ^ 8)
-// - 8) in [-8,7], no zero-point -- weight and activation are both symmetric, so the dp4a dot needs
-// no sum-correction:  w.x = scale_w * scale_x * sum_k( q_w[k] * q_x[k] ).
+// Two kernels, mirroring llama (quantize_mmq_q8_1 + mul_mat_q):
+//   1. q4_dp4a_quantize_x_kernel -- quantise the whole activation matrix to int8 ONCE into scratch.
+//   2. q4_volta_dp4a_gemm_kernel -- the warp-cooperative dp4a GEMM.
+//
+// Weight layout (Q4RowSplitStorage): row-major, K/64 groups/row, 32 code bytes/group (byte b holds
+// K=2b low nibble, K=2b+1 high nibble) + one fp16 scale. int8 weight = ((nibble ^ 8) - 8) in
+// [-8,7], symmetric like the int8 activation, so the dp4a dot needs no sum-correction term.
 
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
@@ -34,58 +34,50 @@ namespace ninfer::ops::detail {
 
 struct Q4VoltaDp4aSchedule {
     static constexpr int kGroupK  = Q4RowSplitStorage::kGroupK; // 64 (one weight group per K-step)
-    static constexpr int kTileN   = 128;                        // output rows per CTA
-    static constexpr int kTileT   = 128;                        // tokens per CTA
-    static constexpr int kThreads = 256;                        // 8 warps
-    // 128x128 = 16384 outputs / 256 threads = 64 outputs/thread, arranged 8 rows x 8 tokens.
-    // Each 4-k dp4a step loads 8 weight + 8 activation int32 (16 shared reads) for 64 dp4a (4:1
-    // reuse). Measured sweep at n=16384 k=5120: 4x4 (2:1) L1-bound 92% = 11 TF/s; 8x4 (2.67:1) =
-    // 10; 8x8 (4:1) L1 66%, occupancy 12.5% (1 block, 256 regs) = 17. Reuse dominates occupancy
-    // here, so the widest tile that still builds wins.
-    static constexpr int kMicroN     = 8;
-    static constexpr int kMicroT     = 8;
-    static constexpr int kRowThreads = kTileN / kMicroN; // 16
-    static constexpr int kColThreads = kTileT / kMicroT; // 16
-    static_assert(kRowThreads * kColThreads == kThreads);
+    static constexpr int kWarp    = 32;
+    static constexpr int kNWarps  = 8;
+    static constexpr int kThreads = kWarp * kNWarps; // 256
+    static constexpr int kTileN   = 64;              // output rows per CTA (lane axis, stride 32)
+    static constexpr int kTileT   = 128;             // tokens per CTA (warp axis, stride kNWarps)
+    static constexpr int kRowsPerThread = kTileN / kWarp;   // 2
+    static constexpr int kToksPerThread = kTileT / kNWarps; // 16
+    static constexpr int kWordsK        = kGroupK / 4;      // 16 int32 words of int8 per group-row
+    static constexpr int kStrideW       = kWordsK + 1;      // 17: odd stride -> conflict-free per-
+                                                            // lane weight rows (int32 reads)
+    static constexpr int kStrideX       = kWordsK;          // 16: 64B rows -> uint4-aligned; the
+                                                            // activation read is a warp broadcast,
+                                                            // so it is bank-conflict-immune anyway
 
-    static constexpr int kQuantThreads = 256; // activation-quantise kernel block
+    static constexpr int kQuantThreads = 256;
 };
 
-// Quantise the activation matrix x[k, t] (token-major, stride k) to int8 xq[t][k] + per-(token,
-// group) fp16 scale xs[t][groups]. One warp per (token, group): 64 bf16 -> amax -> int8 + scale.
+// Quantise activations x[k, t] (token-major, stride k) to int8 xq[t][k] + per-(token,group) fp16
+// scale xs[t][groups]. One warp per (token, group): 64 bf16 -> amax -> int8 + scale.
 __global__ __launch_bounds__(Q4VoltaDp4aSchedule::kQuantThreads) void q4_dp4a_quantize_x_kernel(
     const __nv_bfloat16* __restrict__ x, std::int8_t* __restrict__ xq,
     std::uint16_t* __restrict__ xs, int k, int t, int groups) {
     constexpr int kGroupK = Q4VoltaDp4aSchedule::kGroupK;
-    const int warp   = static_cast<int>(blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5));
-    const int lane   = static_cast<int>(threadIdx.x) & 31;
-    const int total  = t * groups;
-    if (warp >= total) { return; }
+    const int warp  = static_cast<int>(blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5));
+    const int lane  = static_cast<int>(threadIdx.x) & 31;
+    if (warp >= t * groups) { return; }
     const int token = warp / groups;
     const int g     = warp % groups;
 
     const std::int64_t base = static_cast<std::int64_t>(token) * k + g * kGroupK;
-    // 32 lanes, 64 values -> 2 per lane (lane, lane+32).
     const float v0 = __bfloat162float(x[base + lane]);
     const float v1 = __bfloat162float(x[base + lane + 32]);
     float amax     = fmaxf(fabsf(v0), fabsf(v1));
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-    }
+    for (int o = 16; o > 0; o >>= 1) { amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o)); }
     const float s   = amax > 0.0f ? amax / 127.0f : 1.0f;
     const float inv = 1.0f / s;
     std::int8_t* dst = xq + base;
     dst[lane]      = static_cast<std::int8_t>(max(-127, min(127, __float2int_rn(v0 * inv))));
     dst[lane + 32] = static_cast<std::int8_t>(max(-127, min(127, __float2int_rn(v1 * inv))));
-    if (lane == 0) {
-        xs[static_cast<std::int64_t>(token) * groups + g] =
-            __half_as_ushort(__float2half(s));
-    }
+    if (lane == 0) { xs[static_cast<std::int64_t>(token) * groups + g] = __half_as_ushort(__float2half(s)); }
 }
 
-// out[N, T] = W[N, K] (Q4) * xq[T, K] (int8, pre-quantised). One CTA owns a kTileN x kTileT tile;
-// grid = (ceil(N/64), ceil(T/64)). Weights and int8 activations are staged in shared per group.
+// out[N, T] = W[N, K] (Q4) * xq[T, K] (int8). Grid = (ceil(N/kTileN), ceil(T/kTileT)).
 __global__ __launch_bounds__(Q4VoltaDp4aSchedule::kThreads) void q4_volta_dp4a_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const std::int8_t* __restrict__ xq, const std::uint16_t* __restrict__ xs,
@@ -94,55 +86,49 @@ __global__ __launch_bounds__(Q4VoltaDp4aSchedule::kThreads) void q4_volta_dp4a_g
     using S = Q4VoltaDp4aSchedule;
     constexpr int kGroupK = S::kGroupK;
     constexpr int kCodeB  = Q4RowSplitStorage::kCodeBytesPerGroup; // 32
+    constexpr int kW  = S::kStrideW;
+    constexpr int kXW = S::kStrideX;
 
-    const int tid = static_cast<int>(threadIdx.x);
-    const int n0  = static_cast<int>(blockIdx.x) * S::kTileN;
-    const int t0  = static_cast<int>(blockIdx.y) * S::kTileT;
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int n0   = static_cast<int>(blockIdx.x) * S::kTileN;
+    const int t0   = static_cast<int>(blockIdx.y) * S::kTileT;
 
-    __shared__ __align__(16) std::int8_t w_sh[S::kTileN][kGroupK];
-    __shared__ __align__(16) std::int8_t x_sh[S::kTileT][kGroupK];
+    // int32-word shared tiles of packed int8. w_sh is padded to kStrideW (17) for conflict-free
+    // per-lane weight rows; x_sh is kStrideX (16) so its rows are 64B/uint4-aligned.
+    __shared__ __align__(16) std::int32_t w_sh[S::kTileN][kW];
+    __shared__ __align__(16) std::int32_t x_sh[S::kTileT][kXW];
     __shared__ float w_scale[S::kTileN];
     __shared__ float x_scale[S::kTileT];
 
-    const int row_base = (tid % S::kRowThreads) * S::kMicroN;
-    const int col_base = (tid / S::kRowThreads) * S::kMicroT;
-
-    float acc[S::kMicroN][S::kMicroT];
+    // Persistent fp32 accumulators: this thread owns rows {lane, lane+32} x tokens {warp + tt*8}.
+    float acc[S::kRowsPerThread][S::kToksPerThread];
 #pragma unroll
-    for (int i = 0; i < S::kMicroN; ++i)
+    for (int r = 0; r < S::kRowsPerThread; ++r)
 #pragma unroll
-        for (int j = 0; j < S::kMicroT; ++j) { acc[i][j] = 0.0f; }
-
-    // Generic staging strides (kGroupK == 64 -> 8 uint32 of codes/row, 4 uint4 of int8/token).
-    constexpr int kCodeU32 = kGroupK / 8;  // 8 uint32 of code bytes decode 64 nibbles -> wait: 32
-    constexpr int kCodeVecs = kCodeB / 4;  // 8 uint32 code words per row-group (32 bytes)
-    constexpr int kXVecs    = kGroupK / 16; // 4 uint4 of int8 activations per token-group (64 int8)
-    (void)kCodeU32;
+        for (int c = 0; c < S::kToksPerThread; ++c) { acc[r][c] = 0.0f; }
 
     for (int g = 0; g < groups; ++g) {
         __syncthreads();
 
-        // decode weights: kTileN rows x kCodeVecs uint32 code words each. Grid-stride over
-        // (row, word); each word (4 code bytes) decodes to 8 int8 nibbles.
-        for (int u = tid; u < S::kTileN * kCodeVecs; u += S::kThreads) {
-            const int row  = u / kCodeVecs;
-            const int word = u % kCodeVecs;
+        // decode weights: kTileN rows x kWordsK int32 words (each = 2 code bytes -> 4 int8).
+        for (int u = tid; u < S::kTileN * S::kWordsK; u += S::kThreads) {
+            const int row  = u / S::kWordsK;
+            const int word = u % S::kWordsK;
             const int gr   = n0 + row;
-            std::uint32_t packed = 0;
+            std::uint32_t two = 0; // two code bytes for K=[4word .. 4word+3]
             if (gr < n) {
                 const std::uint8_t* crow =
                     codes + (static_cast<std::int64_t>(gr) * padded_groups + g) * kCodeB;
-                packed = reinterpret_cast<const std::uint32_t*>(crow)[word];
+                two = reinterpret_cast<const std::uint16_t*>(crow)[word];
             }
-            // byte b of this word -> K = word*8 + b*2 (lo), +1 (hi).
-#pragma unroll
-            for (int b = 0; b < 4; ++b) {
-                const std::uint8_t code = static_cast<std::uint8_t>(packed >> (8 * b));
-                const int lo = (static_cast<int>(code & 0x0fu) ^ 0x08) - 0x08;
-                const int hi = (static_cast<int>(code >> 4) ^ 0x08) - 0x08;
-                w_sh[row][word * 8 + b * 2]     = static_cast<std::int8_t>(lo);
-                w_sh[row][word * 8 + b * 2 + 1] = static_cast<std::int8_t>(hi);
-            }
+            const int q0 = ((static_cast<int>(two & 0x0fu)) ^ 0x08) - 0x08;         // K=4word
+            const int q1 = ((static_cast<int>((two >> 4) & 0x0fu)) ^ 0x08) - 0x08;  // K=4word+1
+            const int q2 = ((static_cast<int>((two >> 8) & 0x0fu)) ^ 0x08) - 0x08;  // K=4word+2
+            const int q3 = ((static_cast<int>((two >> 12) & 0x0fu)) ^ 0x08) - 0x08; // K=4word+3
+            w_sh[row][word] = (q0 & 0xff) | ((q1 & 0xff) << 8) | ((q2 & 0xff) << 16) |
+                              ((q3 & 0xff) << 24);
         }
         for (int r = tid; r < S::kTileN; r += S::kThreads) {
             const int r2 = n0 + r;
@@ -153,19 +139,17 @@ __global__ __launch_bounds__(Q4VoltaDp4aSchedule::kThreads) void q4_volta_dp4a_g
                          : 0.0f;
         }
 
-        // copy pre-quantised int8 activations: kTileT tokens x kXVecs uint4 (16 int8) each.
-        for (int u = tid; u < S::kTileT * kXVecs; u += S::kThreads) {
-            const int tok = u / kXVecs;
-            const int vec = u % kXVecs;
-            const int col = t0 + tok;
+        // copy pre-quantised int8 activations: kTileT tokens x kWordsK int32 (contiguous int8).
+        for (int u = tid; u < S::kTileT * S::kWordsK; u += S::kThreads) {
+            const int tok  = u / S::kWordsK;
+            const int word = u % S::kWordsK;
+            const int col  = t0 + tok;
+            std::int32_t v = 0;
             if (col < t) {
-                const std::int64_t sbase =
-                    static_cast<std::int64_t>(col) * k + g * kGroupK + vec * 16;
-                *reinterpret_cast<uint4*>(&x_sh[tok][vec * 16]) =
-                    *reinterpret_cast<const uint4*>(&xq[sbase]);
-            } else {
-                *reinterpret_cast<uint4*>(&x_sh[tok][vec * 16]) = uint4{0, 0, 0, 0};
+                v = *reinterpret_cast<const std::int32_t*>(
+                    &xq[static_cast<std::int64_t>(col) * k + g * kGroupK + word * 4]);
             }
+            x_sh[tok][word] = v;
         }
         for (int c = tid; c < S::kTileT; c += S::kThreads) {
             const int c2 = t0 + c;
@@ -176,51 +160,59 @@ __global__ __launch_bounds__(Q4VoltaDp4aSchedule::kThreads) void q4_volta_dp4a_g
 
         __syncthreads();
 
-        std::int32_t iacc[S::kMicroN][S::kMicroT];
+        std::int32_t iacc[S::kRowsPerThread][S::kToksPerThread];
 #pragma unroll
-        for (int i = 0; i < S::kMicroN; ++i)
+        for (int r = 0; r < S::kRowsPerThread; ++r)
 #pragma unroll
-            for (int j = 0; j < S::kMicroT; ++j) { iacc[i][j] = 0; }
+            for (int c = 0; c < S::kToksPerThread; ++c) { iacc[r][c] = 0; }
 
+        // The activation read is the bulk of shared traffic (kToksPerThread rows) and is a warp
+        // broadcast, so it is vectorised to uint4 (one 16-byte load carries 4 int32 words = 16 K),
+        // cutting its load instructions 4x -- the L1/TEX reduction that tips the kernel
+        // compute-bound. Weights are few per thread (kRowsPerThread rows) and must stay on the
+        // conflict-free odd stride, so they are read as int32.
+        static_assert(S::kWordsK % 4 == 0, "uint4 K-vectorisation needs kWordsK % 4 == 0");
 #pragma unroll
-        for (int kk = 0; kk < kGroupK; kk += 4) {
-            std::int32_t wv[S::kMicroN];
-            std::int32_t xv[S::kMicroT];
+        for (int wq = 0; wq < S::kWordsK; wq += 4) {
+            std::int32_t wv[S::kRowsPerThread][4];
 #pragma unroll
-            for (int i = 0; i < S::kMicroN; ++i) {
-                wv[i] = *reinterpret_cast<const std::int32_t*>(&w_sh[row_base + i][kk]);
-            }
+            for (int r = 0; r < S::kRowsPerThread; ++r)
 #pragma unroll
-            for (int j = 0; j < S::kMicroT; ++j) {
-                xv[j] = *reinterpret_cast<const std::int32_t*>(&x_sh[col_base + j][kk]);
-            }
+                for (int s = 0; s < 4; ++s) { wv[r][s] = w_sh[lane + r * S::kWarp][wq + s]; }
 #pragma unroll
-            for (int i = 0; i < S::kMicroN; ++i)
+            for (int c = 0; c < S::kToksPerThread; ++c) {
+                const uint4 xc =
+                    *reinterpret_cast<const uint4*>(&x_sh[warp + c * S::kNWarps][wq]);
 #pragma unroll
-                for (int j = 0; j < S::kMicroT; ++j) {
-                    iacc[i][j] = __dp4a(wv[i], xv[j], iacc[i][j]);
+                for (int s = 0; s < 4; ++s) {
+                    const std::int32_t xw = reinterpret_cast<const std::int32_t*>(&xc)[s];
+#pragma unroll
+                    for (int r = 0; r < S::kRowsPerThread; ++r) {
+                        iacc[r][c] = __dp4a(wv[r][s], xw, iacc[r][c]);
+                    }
                 }
+            }
         }
 
 #pragma unroll
-        for (int i = 0; i < S::kMicroN; ++i) {
-            const float ws = w_scale[row_base + i];
+        for (int r = 0; r < S::kRowsPerThread; ++r) {
+            const float ws = w_scale[lane + r * S::kWarp];
 #pragma unroll
-            for (int j = 0; j < S::kMicroT; ++j) {
-                acc[i][j] += static_cast<float>(iacc[i][j]) * ws * x_scale[col_base + j];
+            for (int c = 0; c < S::kToksPerThread; ++c) {
+                acc[r][c] += static_cast<float>(iacc[r][c]) * ws * x_scale[warp + c * S::kNWarps];
             }
         }
     }
 
 #pragma unroll
-    for (int i = 0; i < S::kMicroN; ++i) {
-        const int row = n0 + row_base + i;
+    for (int r = 0; r < S::kRowsPerThread; ++r) {
+        const int row = n0 + lane + r * S::kWarp;
         if (row >= n) { continue; }
 #pragma unroll
-        for (int j = 0; j < S::kMicroT; ++j) {
-            const int col = t0 + col_base + j;
+        for (int c = 0; c < S::kToksPerThread; ++c) {
+            const int col = t0 + warp + c * S::kNWarps;
             if (col >= t) { continue; }
-            out[static_cast<std::int64_t>(col) * out_ld + row] = __float2bfloat16(acc[i][j]);
+            out[static_cast<std::int64_t>(col) * out_ld + row] = __float2bfloat16(acc[r][c]);
         }
     }
 }
