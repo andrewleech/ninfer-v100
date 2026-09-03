@@ -362,3 +362,25 @@ cross-device step capture + replay **byte-exact**. Opt-in `NINFER_FORCE_CUDA_GRA
 (17→21), but it does **not** stack with MTP (graphs and MTP both cut launch overhead; graph+MTP 38.8 <
 eager+MTP ~40 — the big width-3 verify graph costs more to launch across two devices than it saves). Best
 decode stays **eager + MTP dt2 + balanced split**.
+
+### Decode dispatch fix — the MLP shard was running a matvec on tensor cores (+45% raw)
+
+Checking the dispatch (per the scoping) found a real bug: the dual-card MLP shard ops
+(`q4_linear_swiglu_graph_shard`, `q5_linear_graph_partial`) **always used the tensor-core Volta MMA when
+supported — even at T=1**, where an MMA wastes ~7/8 of its tile on a matrix-*vector*. That was the ~20%-peak
+MLP the profiler flagged. The shard shapes are split-dependent so they can't key into the shape-tabled
+non-shard dispatch, but the fix is to mirror its *logic*:
+
+- q4 gate/up: T=1 → `launch_q4_gemv_r1_w8_direct` (its `launch_gemv` is fully shape-generic), small T → SIMT
+  `r8_c4`, wide T (prefill) → Volta MMA.
+- q5 down: the Q5 GEMV is hardcoded to the k=5120 QKV shapes (unusable for the down proj's k=8192), so T=1
+  and small T use SIMT `r8_c4` (matching the non-shard n=5120 dispatch), wide T → Volta MMA.
+
+**Result (exact parity):** MLP phase 5.72 → 3.07 s, **raw decode 24 → 34.8 tok/s (+45%)**, MTP2 40 → 45
+shallow / 42.5 @41K, prefill unchanged. This closes the decode gap to llama from ~40% to **~15%**. Once the
+kernels are fast, forcing a CUDA graph *hurts* (raw 33 → 25.5) — the multi-device graph-launch overhead
+exceeds the per-kernel savings — so the best decode is **eager + fast kernels + MTP**, not graphs.
+
+Remaining decode breakdown (raw): MLP 48% (GEMV now ~37% of peak, some headroom) / GDN 28% / attention 10% /
+head+embed ~14%. The last ~15% to llama is grindy (more MLP GEMV tuning, GDN, and the attention shard still
+uses MMA at all T — a minor 10% lever). ninfer's prefill + 262K-fit win is unchanged and decisive.
