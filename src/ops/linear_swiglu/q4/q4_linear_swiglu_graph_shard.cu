@@ -73,8 +73,10 @@ void q4_linear_swiglu_graph_shard_launch(const Tensor& x, const Weight& w, Tenso
         // (n=2*shard_intermediate, k=5120) -- the non-shard dispatch's r1_w8 was tuned for the full
         // n=34816. MLP phase -13%, decode +7% at n=16384.
         launch_q4_gemv_r4_w1_direct(x, w, gate_up, stream);
-    } else if (t <= 7) {
-        launch_q4_simt_r8_c4(x, w, gate_up, stream); // MTP verify widths (draft+1) live here
+    } else if (t <= 4) {
+        launch_q4_simt_r8_c4(x, w, gate_up, stream); // MTP dt2/dt3 verify widths (T=3,4)
+    } else if (t <= 8 && q4_volta_qpn_supported(gate_up_rows, k, t)) {
+        launch_q4_volta_qpn(x, w, gate_up, stream); // QPN's band (T 5-8): MTP dt4/dt5 verify widths
     } else if (t >= 16 && q4_volta_mma_supported(gate_up_rows, k, t)) {
         launch_q4_volta_mma(x, w, gate_up, ws, stream);
     } else {
