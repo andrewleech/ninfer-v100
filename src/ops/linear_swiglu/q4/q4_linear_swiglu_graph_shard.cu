@@ -6,6 +6,7 @@
 #include "ops/linear/q4/q4_launch.h"
 #endif
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -68,7 +69,10 @@ void q4_linear_swiglu_graph_shard_launch(const Tensor& x, const Weight& w, Tenso
     // draft+1) uses the SIMT route; only wide T (prefill) amortises the fused Volta MMA. This was the
     // decode bottleneck -- the MLP is ~67% of decode and T=1 on the MMA path ran at ~20% of peak.
     if (t == 1) {
-        launch_q4_gemv_r1_w8_direct(x, w, gate_up, stream);
+        // r4_w1 (4 rows/CTA, 1 warp/row) measured faster than r1_w8 on the SHARD gate/up shapes
+        // (n=2*shard_intermediate, k=5120) -- the non-shard dispatch's r1_w8 was tuned for the full
+        // n=34816. MLP phase -13%, decode +7% at n=16384.
+        launch_q4_gemv_r4_w1_direct(x, w, gate_up, stream);
     } else if (t <= 7) {
         launch_q4_simt_r8_c4(x, w, gate_up, stream); // MTP verify widths (draft+1) live here
     } else if (t >= 16 && q4_volta_mma_supported(gate_up_rows, k, t)) {
