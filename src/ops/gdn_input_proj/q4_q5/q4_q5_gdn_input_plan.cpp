@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -71,7 +72,12 @@ constexpr std::int32_t kVoltaMmaMaxCols = 64;
     // largest of the three rather than their sum.
     const std::size_t a = q4_volta_mma_workspace_bytes(p.qk_rows, p.input_rows, p.cols);
     const std::size_t b = q5_volta_mma_workspace_bytes(p.z_rows, p.input_rows, p.cols);
-    return a > b ? a : b;
+    // The wide-T path may take the dp4a route; its int8 activation scratch depends on k and cols
+    // only (not n), so it is the same for all three GEMMs. Reserve the larger of it and the mma
+    // accumulators so either route fits the same plan.
+    const std::size_t d = q4_volta_dp4a_workspace_bytes(p.qk_rows, p.input_rows, p.cols);
+    const std::size_t m = a > b ? a : b;
+    return m > d ? m : d;
 }
 
 constexpr std::array<RouteSpec, 2> kRoutes{{
@@ -231,6 +237,21 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
         Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
         // value_z_weight is one [2*z_rows, k] parent: rows [0,z_rows) feed value, the rest feed z.
+        // Wide-T prefill takes the compute-bound int8/dp4a route (NINFER_NO_DP4A=1 forces mma).
+        static const bool no_dp4a = [] {
+            const char* e = std::getenv("NINFER_NO_DP4A");
+            return e != nullptr && e[0] == '1';
+        }();
+        const std::int32_t t = problem.cols;
+        if (!no_dp4a && t >= kQ4Dp4aMinT && q4_volta_dp4a_supported(problem.qk_rows, x.ne[0], t) &&
+            q5_volta_dp4a_supported(problem.z_rows, x.ne[0], t)) {
+            launch_q4_volta_dp4a(x, qk_weight, qk, workspace, stream);
+            launch_q5_volta_dp4a(x, value_z_weight, value, /*add_residual=*/false, 0, workspace,
+                                 stream);
+            launch_q5_volta_dp4a(x, value_z_weight, z, /*add_residual=*/false, problem.z_rows,
+                                 workspace, stream);
+            return;
+        }
         launch_q4_volta_mma(x, qk_weight, qk, workspace, stream);
         launch_q5_volta_mma(x, value_z_weight, value, /*add_residual=*/false,
                             /*weight_row_offset=*/0, workspace, stream);
