@@ -12,6 +12,11 @@
 #include "ninfer/ops/silu_mul.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cuda_runtime.h>
 #include <stdexcept>
 
 #define NINFER_QWEN36_VARIANT    ::ninfer::targets::qwen3_6_27b::detail::Variant
@@ -312,6 +317,33 @@ void Variant::post_mixer_shard(const Tensor& hidden, const Weight& gate_up_shard
     auto scope                            = workspace.scope();
     const std::int32_t shard_intermediate = gate_up_shard.n / 2;
     Tensor activation = workspace.alloc(DType::BF16, {shard_intermediate, hidden.ne[1]});
+    // Env-gated MLP sub-profiler (NINFER_MLP_SUBPROF): syncs the stream around gate_up vs down so we
+    // can see whether the decode MLP time is the q4 gate/up GEMV or the q5 down partial. Off default.
+    static const bool subprof = std::getenv("NINFER_MLP_SUBPROF") != nullptr;
+    if (subprof) {
+        static std::atomic<double> t_gu{0}, t_dn{0};
+        static std::atomic<long> cnt{0};
+        static struct Dump {
+            ~Dump() {
+                if (cnt.load() > 0) {
+                    std::fprintf(stderr, "[mlp-sub] calls=%ld gate_up=%.3f down=%.3f (s)\n",
+                                 cnt.load(), t_gu.load(), t_dn.load());
+                }
+            }
+        } dump;
+        cudaStreamSynchronize(stream);
+        const auto a = std::chrono::steady_clock::now();
+        ops::linear_swiglu_graph_shard(hidden, gate_up_shard, activation, workspace, stream);
+        cudaStreamSynchronize(stream);
+        const auto b = std::chrono::steady_clock::now();
+        ops::linear_partial(activation, down_shard, partial, workspace, stream);
+        cudaStreamSynchronize(stream);
+        const auto c = std::chrono::steady_clock::now();
+        t_gu.store(t_gu.load() + std::chrono::duration<double>(b - a).count());
+        t_dn.store(t_dn.load() + std::chrono::duration<double>(c - b).count());
+        cnt.fetch_add(1);
+        return;
+    }
     ops::linear_swiglu_graph_shard(hidden, gate_up_shard, activation, workspace, stream);
     ops::linear_partial(activation, down_shard, partial, workspace, stream);
 }
