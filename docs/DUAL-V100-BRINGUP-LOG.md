@@ -314,3 +314,51 @@ slower), greedy output **byte-identical** to tp-off on a flash-exercising prompt
 Remaining: decode at the 4096 split is ~14 tok/s (the split unbalances the MLP shards; MTP would lift it,
 or a context-aware split could balance better below 262K). The projection GEMM (0.51 s) is now the largest
 TP phase — the next prefill lever if wanted.
+
+---
+
+## vs llama.cpp Q6_K — where ninfer wins and where it doesn't (measured 2026-09-03)
+
+Reference (same box, `v100-llm-kit/dev-notes/qwen27b-trial-results.md`): llama.cpp Qwen3.6-27B **Q6_K
+`-sm tensor`, q4_0 KV, FA on**. PREFILL PP512 725(d0)/311(131k)/190(262k); DECODE raw 40.9(shallow)/16.8(262k),
+**+MTP 57.5(shallow)/37.4(128k)/~23(262k)**. ninfer TP best (mlp8192 ≤213K / mlp3072 @262K, MTP dt2>dt3):
+
+| | ninfer TP | llama Q6 | winner |
+|---|---|---|---|
+| Prefill @41K | **621** | ~510 | **ninfer +22%** |
+| Prefill @220K | **293** | ~230 | **ninfer +27%** |
+| Prefill @262K | ~290 | 190 | **ninfer +54%** |
+| Decode @shallow | ~40 (eager+MTP2) | 40.9 / **57.5** (+MTP) | llama |
+| Decode @41K | 37.4 | ~30 / 37.4 | tie |
+| Decode @262K | 17.7 | 16.8 / ~23 | ~tie / llama |
+
+**ninfer wins prefill decisively at every depth** (compute-bound; dual-card split + flash). **llama wins pure
+decode** once it uses MTP. For long-document single-session (prefill-dominated) ninfer is faster end-to-end;
+for chat-style high-decode, llama leads.
+
+**KV / quality note:** the llama numbers above are its **q4_0-KV** config (fastest, but a long-context
+quality regression — Q4 KV is not a production-quality setting). ninfer serves **int8 KV (8-bit)**, higher
+quality than q4_0 *or* Q5_1; a quality-matched llama (Q5_1 KV) is equal-speed at shallow but slower at depth,
+so ninfer's real decode gap is ≤ what's tabled here.
+
+### Decode gap root-caused to the MLP matvec (scoping, not yet acted on)
+
+`NINFER_DECODE_PROFILE` (env; syncs the primary stream around each mixer/mlp call in `run_layers`) on raw
+decode gives the per-forward split: **MLP 67% · GDN 21% · attention 8%**. The MLP projection dominates, and
+it is **GEMV-bound, not launch/sync-bound** — forcing a CUDA graph does *not* speed MLP-only decode. Weight
+bandwidth math: each card reads ~5–6 GB of MLP weights/token (~5.7 ms floor at 900 GB/s) but the MLP phase
+is ~28 ms/token, so the **Q4/Q5 groupwise-int T=1 matvec runs at ~20% of Volta peak**. Sharpest framing:
+ninfer's MLP *alone* (28 ms) exceeds llama's *entire* forward (24 ms) → llama's MLP is ~2× faster. The
+`q4_rowsplit_gemv` kernel is already `uint4`-vectorised / warp-reduced / group-tiled (519 lines), so the 2×
+is a mature-kernel gap, not a naive bug. Closing it is deep work (a better Volta matvec or a more
+GEMV-friendly quant), weeks, uncertain. Attention is already flash (only 8%).
+
+### Multi-device CUDA graph capture works (the assumption was wrong)
+
+`engine.cpp` hard-disabled graphs for >1 device ("cannot be captured as one single-device graph"). Not true
+on CUDA 12.8 — the only blocker was `cudaMemcpyPeerAsync` (`cudaErrorStreamCaptureUnsupported`). Swapping the
+5 cross-card peer copies to the capturable UVA `cudaMemcpyAsync(..., cudaMemcpyDefault)` lets the whole
+cross-device step capture + replay **byte-exact**. Opt-in `NINFER_FORCE_CUDA_GRAPH`: **raw decode +25%**
+(17→21), but it does **not** stack with MTP (graphs and MTP both cut launch overhead; graph+MTP 38.8 <
+eager+MTP ~40 — the big width-3 verify graph costs more to launch across two devices than it saves). Best
+decode stays **eager + MTP dt2 + balanced split**.
