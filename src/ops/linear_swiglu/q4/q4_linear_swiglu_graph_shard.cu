@@ -69,6 +69,8 @@ void q4_linear_swiglu_graph_shard_launch(const Tensor& x, const Weight& w, Tenso
     // decode bottleneck -- the MLP is ~67% of decode and T=1 on the MMA path ran at ~20% of peak.
     if (t == 1) {
         launch_q4_gemv_r1_w8_direct(x, w, gate_up, stream);
+    } else if (t <= 7) {
+        launch_q4_simt_r8_c4(x, w, gate_up, stream); // MTP verify widths (draft+1) live here
     } else if (t >= 16 && q4_volta_mma_supported(gate_up_rows, k, t)) {
         launch_q4_volta_mma(x, w, gate_up, ws, stream);
     } else {

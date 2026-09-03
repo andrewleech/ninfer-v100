@@ -53,8 +53,8 @@ void q5_linear_graph_partial_launch(const Tensor& x, const Weight& w, Tensor& ou
     // (prefill) amortises the fused Volta MMA. Small T on the MMA path was ~20% of peak (the decode
     // bottleneck; MTP verify runs the main model at draft+1, still small T).
     const std::int32_t t = x.ne[1];
-    if (t == 1) {
-        launch_q5_simt_r8_c4(x, w, out, stream);
+    if (t <= 7) {
+        launch_q5_simt_r8_c4(x, w, out, stream); // T=1 decode + MTP verify widths (draft+1)
     } else if (t >= 16 && q5_volta_mma_supported(out.ne[0], x.ne[0], t)) {
         launch_q5_volta_mma(x, w, out, /*add_residual=*/false, /*weight_row_offset=*/0, ws, stream);
     } else {
