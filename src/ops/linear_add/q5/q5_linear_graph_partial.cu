@@ -47,7 +47,15 @@ void q5_linear_graph_partial_launch(const Tensor& x, const Weight& w, Tensor& ou
     // every 27B down shard (n=5120, k in {8192,9216} are whole Q5 groups, splits<=2 so k/splits>>
     // kKStep); guard + SIMT fallback anyway, mirroring the swiglu sibling, so a future smaller n
     // can't silently launch a malformed config.
-    if (q5_volta_mma_supported(out.ne[0], x.ne[0], x.ne[1])) {
+    // Route by token width like the non-shard q5 dispatch does for the down projection (n=5120): the
+    // Q5 GEMV is hardcoded to the k=5120 QKV shapes, so the down proj (k = shard intermediate) uses
+    // the SIMT route at small T -- T=1 (decode) via r8_c4, larger small T via r8_c8 -- and only wide T
+    // (prefill) amortises the fused Volta MMA. Small T on the MMA path was ~20% of peak (the decode
+    // bottleneck; MTP verify runs the main model at draft+1, still small T).
+    const std::int32_t t = x.ne[1];
+    if (t == 1) {
+        launch_q5_simt_r8_c4(x, w, out, stream);
+    } else if (t >= 16 && q5_volta_mma_supported(out.ne[0], x.ne[0], t)) {
         launch_q5_volta_mma(x, w, out, /*add_residual=*/false, /*weight_row_offset=*/0, ws, stream);
     } else {
         launch_q5_simt_r8_c8(x, w, out, stream);

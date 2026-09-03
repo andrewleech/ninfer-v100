@@ -62,10 +62,14 @@ void q4_linear_swiglu_graph_shard_launch(const Tensor& x, const Weight& w, Tenso
     }
     auto scope     = ws.scope();
     Tensor gate_up = ws.alloc(DType::BF16, {gate_up_rows, t});
-    // gate_up = W @ x. Both shard geometries ([16384,5120], [18432,5120]) satisfy
-    // q4_volta_mma_supported (k=5120 is a whole number of Q4 groups); fall back to the general SIMT
-    // route for any shape it declines.
-    if (q4_volta_mma_supported(gate_up_rows, k, t)) {
+    // gate_up = W @ x. Route by token width the same way the non-shard q4 dispatch does (the split
+    // shapes can't key into its shape table): T=1 (decode) is a matrix-vector -- use the dedicated
+    // GEMV instead of wasting the tensor-core tile; small T (MTP verify runs the main model at
+    // draft+1) uses the SIMT route; only wide T (prefill) amortises the fused Volta MMA. This was the
+    // decode bottleneck -- the MLP is ~67% of decode and T=1 on the MMA path ran at ~20% of peak.
+    if (t == 1) {
+        launch_q4_gemv_r1_w8_direct(x, w, gate_up, stream);
+    } else if (t >= 16 && q4_volta_mma_supported(gate_up_rows, k, t)) {
         launch_q4_volta_mma(x, w, gate_up, ws, stream);
     } else {
         launch_q4_simt_r8_c8(x, w, gate_up, stream);
