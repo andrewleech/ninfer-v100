@@ -111,21 +111,46 @@ void randomize_weight(bench::PackedQuantizedWeight& w, std::int32_t n, std::int3
                              static_cast<std::size_t>(w.scale_offset));
 }
 
-double max_rel_error(const std::vector<std::uint16_t>& ref, const std::vector<std::uint16_t>& got) {
+double max_rel_error(const std::vector<std::uint16_t>& ref, const std::vector<std::uint16_t>& got,
+                     bool dump = false) {
     auto bf16 = [](std::uint16_t b) {
         std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
         float f;
         std::memcpy(&f, &u, 4);
         return f;
     };
-    double worst = 0.0;
+    double worst      = 0.0;
+    std::size_t worst_i = 0;
     for (std::size_t i = 0; i < ref.size(); ++i) {
         const float a = bf16(ref[i]);
         const float b = bf16(got[i]);
         const float denom = std::max(1e-3f, std::abs(a));
-        worst = std::max(worst, static_cast<double>(std::abs(a - b) / denom));
+        const double r    = static_cast<double>(std::abs(a - b) / denom);
+        if (r > worst) { worst = r; worst_i = i; }
     }
+    (void)worst_i;
+    (void)dump;
     return worst;
+}
+
+// Error normalised by the reference magnitude scale (max |ref|), the right metric for an int8
+// path: near-zero outputs (from cancellation) carry large per-element relative error even when the
+// absolute error is a tiny fraction of a typical output.
+double magnitude_rel_error(const std::vector<std::uint16_t>& ref,
+                           const std::vector<std::uint16_t>& got) {
+    auto bf16 = [](std::uint16_t b) {
+        std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
+        float f;
+        std::memcpy(&f, &u, 4);
+        return f;
+    };
+    float max_abs   = 1e-6f;
+    float worst_err = 0.0f;
+    for (std::size_t i = 0; i < ref.size(); ++i) {
+        max_abs   = std::max(max_abs, std::abs(bf16(ref[i])));
+        worst_err = std::max(worst_err, std::abs(bf16(ref[i]) - bf16(got[i])));
+    }
+    return static_cast<double>(worst_err / max_abs);
 }
 
 } // namespace
@@ -188,6 +213,36 @@ int main(int argc, char** argv) {
             const double flops = 2.0 * n * k * t;
             std::printf("   median=%.2f us   %.2f TFLOP/s\n", timing.median_us,
                         flops / (timing.median_us * 1e-6) / 1e12);
+
+            // int8/dp4a route: validate vs the same bf16 SIMT oracle with a LOOSER threshold --
+            // int8 activation quant is an approximation (~0.5-1% rel err), not a bit-match, so a
+            // correct kernel lands well under 2% while a bug (wrong K-order/scale) blows up.
+            {
+                DeviceBuffer out_dp4a(static_cast<std::size_t>(n) * max_t * 2);
+                Tensor odp(out_dp4a.p, DType::BF16, {n, t});
+                std::printf("    dp4a");
+                if (o.validate) {
+                    Tensor osimt(out_simt.p, DType::BF16, {n, t});
+                    detail::launch_q4_simt_r8_c8(xt, weight.weight, osimt, stream);
+                    detail::launch_q4_volta_dp4a(xt, weight.weight, odp, ws, stream);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    std::vector<std::uint16_t> h_ref(static_cast<std::size_t>(n) * t);
+                    std::vector<std::uint16_t> h_got(static_cast<std::size_t>(n) * t);
+                    out_simt.copy_to_host(h_ref.data(), h_ref.size() * 2);
+                    out_dp4a.copy_to_host(h_got.data(), h_got.size() * 2);
+                    // int8 activation quant: measure error against the output magnitude scale.
+                    const double rel = magnitude_rel_error(h_ref, h_got);
+                    std::printf(" %-6s mag_rel_err=%.4f%%", rel < 0.01 ? "PASS" : "FAIL",
+                                rel * 100.0);
+                }
+                const bench::ColdTiming td = bench::measure_launch(
+                    [&](cudaStream_t s) {
+                        detail::launch_q4_volta_dp4a(xt, weight.weight, odp, ws, s);
+                    },
+                    stream, o.warmup, o.repeat);
+                std::printf("   median=%.2f us   %.2f TFLOP/s\n", td.median_us,
+                            flops / (td.median_us * 1e-6) / 1e12);
+            }
         }
         CUDA_CHECK(cudaStreamDestroy(stream));
         return 0;

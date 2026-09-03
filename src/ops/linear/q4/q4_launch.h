@@ -35,6 +35,16 @@ void launch_q4_volta_qpn(const Tensor& x, const Weight& w, Tensor& out, cudaStre
 [[nodiscard]] bool q4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                           std::int32_t t) noexcept;
 
+// int8/dp4a route (q4_volta_dp4a_gemm.cuh) -- Phase-1 prototype of the MMQ-style prefill path
+// (activations->int8 Q8_1, Q4 weights as int8, __dp4a int32 accumulate, group scales in epilogue).
+// No split-K workspace: each CTA owns a 32x32 output tile and stores bf16 straight out.
+void launch_q4_volta_dp4a(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& ws,
+                          cudaStream_t stream, std::int32_t weight_row_offset = 0);
+[[nodiscard]] bool q4_volta_dp4a_supported(std::int32_t n, std::int32_t k,
+                                           std::int32_t t) noexcept;
+[[nodiscard]] std::size_t q4_volta_dp4a_workspace_bytes(std::int32_t n, std::int32_t k,
+                                                        std::int32_t t) noexcept;
+
 // Band for the quadpair-split-N route (q4_volta_qpn_gemm.cuh), measured at k=5120 against
 // whichever route production would otherwise take -- sliced SIMT below T=9, the fused 32x8 kernel
 // from 9 up. Microseconds, incumbent -> qpn:
