@@ -8,6 +8,7 @@
 #include "runtime/engine/engine_core.h"
 #include "targets/registry.h"
 
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -26,7 +27,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.devices = {options.device};
     } else {
         options.device = options.devices.front();
-        if (options.devices.size() > 1) { options.use_cuda_graph = false; }
+        // Graph parallelism was assumed uncapturable as one single-device CUDA graph. Probe whether
+        // multi-device capture actually works (the big decode lever) via NINFER_FORCE_CUDA_GRAPH.
+        if (options.devices.size() > 1 && std::getenv("NINFER_FORCE_CUDA_GRAPH") == nullptr) {
+            options.use_cuda_graph = false;
+        }
     }
     switch (options.purpose) {
     case EnginePurpose::Generation:

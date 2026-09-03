@@ -1025,8 +1025,7 @@ void TextContext::post_mixer_graph(const Tensor& hidden, const Payload& payload,
     cudaStream_t primary_stream     = ctx_.stream_for_rank(0);
     cudaEvent_t primary_ready       = ctx_.fence_for_rank(0);
     cudaEvent_t secondary_ready     = ctx_.fence_for_rank(1);
-    const int primary_device        = ctx_.device_ids()[0];
-    const int secondary_device      = ctx_.device_ids()[1];
+    // Peer copies use UVA cudaMemcpyAsync (capturable), so explicit device ids are no longer needed.
 
     // Both partials and the peer landing buffer live in the primary arena (already inside the
     // caller's mlp scope). residual holds the post-attention residual and is updated in place.
@@ -1049,8 +1048,8 @@ void TextContext::post_mixer_graph(const Tensor& hidden, const Payload& payload,
         Tensor secondary_hidden       = secondary_work_->alloc(DType::BF16, {hidden_dim, tokens});
         secondary_partial             = secondary_work_->alloc(DType::BF16, {hidden_dim, tokens});
         CUDA_CHECK(cudaStreamWaitEvent(secondary_stream, primary_ready, 0));
-        CUDA_CHECK(cudaMemcpyPeerAsync(secondary_hidden.data, secondary_device, hidden.data,
-                                       primary_device, hidden.bytes(), secondary_stream));
+        CUDA_CHECK(cudaMemcpyAsync(secondary_hidden.data, hidden.data, hidden.bytes(),
+                                   cudaMemcpyDefault, secondary_stream));
         V::post_mixer_shard(secondary_hidden, payload.secondary_gate_up, payload.secondary_down,
                             secondary_partial, *secondary_work_, secondary_stream);
         CUDA_CHECK(cudaEventRecord(secondary_ready, secondary_stream));
@@ -1059,8 +1058,8 @@ void TextContext::post_mixer_graph(const Tensor& hidden, const Payload& payload,
     // both partials into the residual. All three enqueue on the primary stream, so end-of-step sync
     // of the primary stream alone gates the next layer.
     CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
-    CUDA_CHECK(cudaMemcpyPeerAsync(peer_partial.data, primary_device, secondary_partial.data,
-                                   secondary_device, peer_partial.bytes(), primary_stream));
+    CUDA_CHECK(cudaMemcpyAsync(peer_partial.data, secondary_partial.data, peer_partial.bytes(),
+                               cudaMemcpyDefault, primary_stream));
     ops::residual_add_two(primary_partial, peer_partial, residual, primary_stream);
 }
 
@@ -1119,8 +1118,7 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
     cudaStream_t secondary_stream = ctx_.stream_for_rank(1);
     cudaEvent_t primary_ready     = ctx_.fence_for_rank(0);
     cudaEvent_t secondary_ready   = ctx_.fence_for_rank(1);
-    const int primary_device      = ctx_.device_ids()[0];
-    const int secondary_device    = ctx_.device_ids()[1];
+    // Peer copies use UVA cudaMemcpyAsync (capturable), so explicit device ids are no longer needed.
 
     const Tensor& cache_positions =
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
@@ -1163,8 +1161,8 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
     const auto peer_dup = [&](WorkspaceArena& W, const Tensor& src, cudaStream_t stream) -> Tensor {
         Tensor dst = src.ne[1] > 1 ? W.alloc(src.dtype, {src.ne[0], src.ne[1]})
                                    : W.alloc(src.dtype, {src.ne[0]});
-        CUDA_CHECK(cudaMemcpyPeerAsync(dst.data, secondary_device, src.data, primary_device,
-                                       src.bytes(), stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(dst.data, src.data, src.bytes(), cudaMemcpyDefault, stream));
         return dst;
     };
 
@@ -1255,8 +1253,8 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
         // address identical physical slots (same layout + capacity => same matrix shape).
         ninfer::PagedKVBatchLayerView sec_view = secondary_batch_text_kv_->batch_layer_view(fidx);
         const Tensor primary_bt = batch_text_kv_->batch_layer_view(fidx).block_tables;
-        CUDA_CHECK(cudaMemcpyPeerAsync(sec_view.block_tables.data, secondary_device, primary_bt.data,
-                                       primary_device, primary_bt.bytes(), secondary_stream));
+        CUDA_CHECK(cudaMemcpyAsync(sec_view.block_tables.data, primary_bt.data, primary_bt.bytes(),
+                                   cudaMemcpyDefault, secondary_stream));
         secondary_a = secondary_work_->alloc(DType::BF16, {q_half_rows, T});
         compute_half(secondary_stream, *secondary_work_, split->secondary_query_key,
                      split->secondary_gate_value, sec_view, h_d1, qnorm_d1, knorm_d1, cache_d1,
@@ -1268,8 +1266,8 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
     CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
     Tensor a_peer = work_.alloc(DType::BF16, {q_half_rows, T});
     tp_phase(t_copy, primary_stream, [&] {
-        CUDA_CHECK(cudaMemcpyPeerAsync(a_peer.data, primary_device, secondary_a.data,
-                                       secondary_device, a_peer.bytes(), primary_stream));
+        CUDA_CHECK(cudaMemcpyAsync(a_peer.data, secondary_a.data, a_peer.bytes(), cudaMemcpyDefault,
+                                   primary_stream));
         scatter(a_full, a_peer, q_half_rows, primary_stream);
     });
     tp_phase(t_oproj, primary_stream,
