@@ -24,6 +24,15 @@ void launch_q5_volta_mma(const Tensor& x, const Weight& w, Tensor& out, bool add
 [[nodiscard]] bool q5_volta_mma_supported(std::int32_t n, std::int32_t k,
                                           std::int32_t t) noexcept;
 [[nodiscard]] int q5_volta_mma_splits(std::int32_t n, std::int32_t k, std::int32_t t) noexcept;
+
+// int8/dp4a route (q5_volta_dp4a_gemm.cuh) -- the compute-bound wide-T prefill path, Q5 sibling of
+// launch_q4_volta_dp4a. `add_residual` folds into `out`. Uses a scoped int8 activation scratch.
+void launch_q5_volta_dp4a(const Tensor& x, const Weight& w, Tensor& out, bool add_residual,
+                          std::int32_t weight_row_offset, WorkspaceArena& ws, cudaStream_t stream);
+[[nodiscard]] bool q5_volta_dp4a_supported(std::int32_t n, std::int32_t k,
+                                           std::int32_t t) noexcept;
+[[nodiscard]] std::size_t q5_volta_dp4a_workspace_bytes(std::int32_t n, std::int32_t k,
+                                                        std::int32_t t) noexcept;
 #endif
 
 void launch_q5_gemv_r16_s2_x(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);

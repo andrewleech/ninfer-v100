@@ -11,6 +11,18 @@
 
 namespace ninfer::ops::detail {
 
+#ifdef NINFER_VOLTA_BUILD
+// A/B toggle: NINFER_NO_DP4A=1 forces the fp16 mma route for the wide-T prefill GEMMs, for
+// measuring the int8/dp4a speedup end-to-end. Read once.
+static bool q4_dp4a_prefill_enabled() {
+    static const bool disabled = [] {
+        const char* e = std::getenv("NINFER_NO_DP4A");
+        return e != nullptr && e[0] == '1';
+    }();
+    return !disabled;
+}
+#endif
+
 // Dual-device MLP gate/up for one card's compact row shard of the packed gate_up weight. Unlike the
 // single-card schedules in q4_linear_swiglu_plan.cpp, this admits any even row count rather than the
 // exact [34816,5120] registration: the two 27B shards are [16384,5120] (out 8192) and [18432,5120]
@@ -39,10 +51,17 @@ std::size_t q4_linear_swiglu_graph_shard_workspace_bytes(std::int32_t gate_up_ro
     // every T<=max_tokens.
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens});
+    // Above gate_up, whichever wide-T route runs stacks its own scratch: mma its fp32 split-K
+    // accumulator (0 when the shape single-splits, as every 27B shard does), dp4a its int8
+    // activation buffer. Reserve the larger so either route fits.
+    std::size_t mma_extra = 0;
     if (q4_volta_mma_splits(gate_up_rows, input_rows, min_tokens) > 1) {
-        (void)layout.alloc_bytes(static_cast<std::size_t>(gate_up_rows) *
-                                 static_cast<std::size_t>(max_tokens) * sizeof(float));
+        mma_extra = static_cast<std::size_t>(gate_up_rows) *
+                    static_cast<std::size_t>(max_tokens) * sizeof(float);
     }
+    const std::size_t dp4a_extra =
+        q4_volta_dp4a_workspace_bytes(gate_up_rows, input_rows, max_tokens);
+    (void)layout.alloc_bytes(mma_extra > dp4a_extra ? mma_extra : dp4a_extra);
     return layout.peak_bytes();
 #else
     (void)input_rows;
@@ -77,6 +96,11 @@ void q4_linear_swiglu_graph_shard_launch(const Tensor& x, const Weight& w, Tenso
         launch_q4_simt_r8_c4(x, w, gate_up, stream); // MTP dt2/dt3 verify widths (T=3,4)
     } else if (t <= 8 && q4_volta_qpn_supported(gate_up_rows, k, t)) {
         launch_q4_volta_qpn(x, w, gate_up, stream); // QPN's band (T 5-8): MTP dt4/dt5 verify widths
+    } else if (q4_dp4a_prefill_enabled() && t >= kQ4Dp4aMinT &&
+               q4_volta_dp4a_supported(gate_up_rows, k, t)) {
+        // Wide-T prefill: the int8/dp4a route is compute-bound (~72% FMA pipe) where the fp16
+        // mma route is L1/shared-bound, so it runs the gate/up GEMM ~1.4x faster on the V100.
+        launch_q4_volta_dp4a(x, w, gate_up, ws, stream);
     } else if (t >= 16 && q4_volta_mma_supported(gate_up_rows, k, t)) {
         launch_q4_volta_mma(x, w, gate_up, ws, stream);
     } else {

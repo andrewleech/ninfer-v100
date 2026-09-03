@@ -44,6 +44,10 @@ void launch_q4_volta_dp4a(const Tensor& x, const Weight& w, Tensor& out, Workspa
                                            std::int32_t t) noexcept;
 [[nodiscard]] std::size_t q4_volta_dp4a_workspace_bytes(std::int32_t n, std::int32_t k,
                                                         std::int32_t t) noexcept;
+// Token width at/above which the graph-shard prefill GEMMs prefer the int8/dp4a route over the
+// fp16 mma route. dp4a's 128-token tile wants a wide T; MTP verify widths (T<=8) and small prefill
+// chunks stay on mma. Prefill runs at chunk 2048, well above this.
+constexpr std::int32_t kQ4Dp4aMinT = 128;
 
 // Band for the quadpair-split-N route (q4_volta_qpn_gemm.cuh), measured at k=5120 against
 // whichever route production would otherwise take -- sliced SIMT below T=9, the fused 32x8 kernel

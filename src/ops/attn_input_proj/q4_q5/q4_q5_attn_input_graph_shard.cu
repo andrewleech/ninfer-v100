@@ -6,9 +6,20 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+
+#ifdef NINFER_VOLTA_BUILD
+static bool attn_q4_dp4a_prefill_enabled() {
+    static const bool disabled = [] {
+        const char* e = std::getenv("NINFER_NO_DP4A");
+        return e != nullptr && e[0] == '1';
+    }();
+    return !disabled;
+}
+#endif
 
 // One card's tensor-parallel attention projection. The 24q/4kv layer splits 12q/2kv per card, so the
 // packed Q4 query_key parent [7168,5120] (q 6144 | k 1024) becomes a [3584,5120] shard (q 3072 | k
@@ -35,6 +46,10 @@ std::size_t attn_input_proj_graph_shard_workspace_bytes(std::int32_t qk_rows, st
         bytes = std::max(bytes, static_cast<std::size_t>(qk_rows) *
                                     static_cast<std::size_t>(max_tokens) * sizeof(float));
     }
+    // The wide-T query_key GEMM may take the dp4a route; its int8 activation scratch is scoped to
+    // that GEMM, so reserve the larger of it and the mma accumulators.
+    bytes = std::max(bytes, q4_volta_dp4a_workspace_bytes(qk_rows, input_rows, max_tokens));
+    bytes = std::max(bytes, q5_volta_dp4a_workspace_bytes(gv_rows, input_rows, max_tokens));
     if (q5_volta_mma_splits(gv_rows, input_rows, min_tokens) > 1) {
         bytes = std::max(bytes, static_cast<std::size_t>(gv_rows) *
                                     static_cast<std::size_t>(max_tokens) * sizeof(float));
@@ -67,6 +82,9 @@ void attn_input_proj_graph_shard_launch(const Tensor& x, const Weight& query_key
             launch_q4_gemv_r1_w8_direct(x, query_key_shard, qk_out, stream);
         } else if (t <= 7) {
             launch_q4_simt_r8_c4(x, query_key_shard, qk_out, stream);
+        } else if (attn_q4_dp4a_prefill_enabled() && t >= kQ4Dp4aMinT &&
+                   q4_volta_dp4a_supported(qk_out.ne[0], k, t)) {
+            launch_q4_volta_dp4a(x, query_key_shard, qk_out, ws, stream); // compute-bound prefill
         } else if (t >= 16 && q4_volta_mma_supported(qk_out.ne[0], k, t)) {
             launch_q4_volta_mma(x, query_key_shard, qk_out, ws, stream);
         } else {
@@ -77,6 +95,9 @@ void attn_input_proj_graph_shard_launch(const Tensor& x, const Weight& query_key
         auto scope = ws.scope();
         if (t <= 7) {
             launch_q5_simt_r8_c4(x, gate_value_shard, gv_out, stream);
+        } else if (attn_q4_dp4a_prefill_enabled() && t >= kQ4Dp4aMinT &&
+                   q5_volta_dp4a_supported(gv_out.ne[0], k, t)) {
+            launch_q5_volta_dp4a(x, gate_value_shard, gv_out, /*add_residual=*/false, 0, ws, stream);
         } else if (t >= 16 && q5_volta_mma_supported(gv_out.ne[0], k, t)) {
             launch_q5_volta_mma(x, gate_value_shard, gv_out, /*add_residual=*/false,
                                 /*weight_row_offset=*/0, ws, stream);

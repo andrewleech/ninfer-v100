@@ -1,10 +1,12 @@
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/q4/q4_launch.h" // kQ4Dp4aMinT (shared dp4a wide-T threshold)
 #include "ops/linear/q5/q5_launch.h"
 #endif
 
 #include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -30,9 +32,16 @@ std::size_t q5_linear_graph_partial_workspace_bytes(std::int32_t output_rows,
     // end (min_tokens) already resolves to a single split, every T in the interval does too and no
     // accumulator is ever allocated; otherwise reserve the largest possible extent
     // (output_rows*max_tokens*4), which dominates output_rows*T*4 for every T<=max_tokens.
-    if (q5_volta_mma_splits(output_rows, input_rows, min_tokens) <= 1) { return 0; }
-    return static_cast<std::size_t>(output_rows) * static_cast<std::size_t>(max_tokens) *
-           sizeof(float);
+    // Wide T may take the dp4a route (int8 activation scratch); reserve the larger of it and the
+    // mma split-K accumulator.
+    std::size_t mma_extra = 0;
+    if (q5_volta_mma_splits(output_rows, input_rows, min_tokens) > 1) {
+        mma_extra = static_cast<std::size_t>(output_rows) * static_cast<std::size_t>(max_tokens) *
+                    sizeof(float);
+    }
+    const std::size_t dp4a_extra =
+        q5_volta_dp4a_workspace_bytes(output_rows, input_rows, max_tokens);
+    return mma_extra > dp4a_extra ? mma_extra : dp4a_extra;
 #else
     (void)input_rows;
     throw std::logic_error("q5 linear graph partial is Volta-only");
@@ -53,8 +62,14 @@ void q5_linear_graph_partial_launch(const Tensor& x, const Weight& w, Tensor& ou
     // (prefill) amortises the fused Volta MMA. Small T on the MMA path was ~20% of peak (the decode
     // bottleneck; MTP verify runs the main model at draft+1, still small T).
     const std::int32_t t = x.ne[1];
+    static const bool no_dp4a = [] {
+        const char* e = std::getenv("NINFER_NO_DP4A");
+        return e != nullptr && e[0] == '1';
+    }();
     if (t <= 7) {
         launch_q5_simt_r8_c4(x, w, out, stream); // T=1 decode + MTP verify widths (draft+1)
+    } else if (!no_dp4a && t >= kQ4Dp4aMinT && q5_volta_dp4a_supported(out.ne[0], x.ne[0], t)) {
+        launch_q5_volta_dp4a(x, w, out, /*add_residual=*/false, /*weight_row_offset=*/0, ws, stream);
     } else if (t >= 16 && q5_volta_mma_supported(out.ne[0], x.ne[0], t)) {
         launch_q5_volta_mma(x, w, out, /*add_residual=*/false, /*weight_row_offset=*/0, ws, stream);
     } else {
