@@ -59,7 +59,7 @@ __global__ __launch_bounds__(Q5VoltaDp4aSchedule::kQuantThreads) void q5_dp4a_qu
 
 // out[N, T] (+= if kAddResidual) = W[N, K] (Q5) * xq[T, K] (int8).
 template <bool kAddResidual>
-__global__ __launch_bounds__(Q5VoltaDp4aSchedule::kThreads) void q5_volta_dp4a_gemm_kernel(
+__global__ __launch_bounds__(Q5VoltaDp4aSchedule::kThreads, 2) void q5_volta_dp4a_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ high,
     const std::uint8_t* __restrict__ scales, const std::int8_t* __restrict__ xq,
     const std::uint16_t* __restrict__ xs, __nv_bfloat16* __restrict__ out, int out_ld, int n, int k,
@@ -106,15 +106,18 @@ __global__ __launch_bounds__(Q5VoltaDp4aSchedule::kThreads) void q5_volta_dp4a_g
                 const std::uint8_t hbyte = (high + grp * kHighB)[word >> 1];
                 hbit = (static_cast<std::uint32_t>(hbyte) >> (4 * (word & 1))) & 0x0fu;
             }
-            int q[4];
+            // Build the packed int32 of four int8 weights in one accumulator (no q[4] array) to
+            // keep the decode register-frugal -- the extra 5-bit-decode registers were pinning the
+            // kernel to 1 block/SM (12.5% occupancy) vs the Q4 sibling's 2 blocks.
+            std::uint32_t packed = 0;
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int lo = static_cast<int>((two >> (4 * i)) & 0x0fu);
                 const int hi = static_cast<int>((hbit >> i) & 0x1u);
-                q[i] = ((lo | (hi << 4)) ^ 0x10) - 0x10; // [-16,15]
+                const int q  = ((lo | (hi << 4)) ^ 0x10) - 0x10; // [-16,15]
+                packed |= static_cast<std::uint32_t>(q & 0xff) << (8 * i);
             }
-            w_sh[row][word] = (q[0] & 0xff) | ((q[1] & 0xff) << 8) | ((q[2] & 0xff) << 16) |
-                              ((q[3] & 0xff) << 24);
+            w_sh[row][word] = static_cast<std::int32_t>(packed);
         }
         for (int r = tid; r < S::kTileN; r += S::kThreads) {
             const int r2 = n0 + r;
