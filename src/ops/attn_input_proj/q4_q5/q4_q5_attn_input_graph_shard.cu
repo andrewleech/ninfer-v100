@@ -56,9 +56,18 @@ void attn_input_proj_graph_shard_launch(const Tensor& x, const Weight& query_key
     // whole number of groups); fall back to the general SIMT route for any shape they decline. Each
     // GEMM is scoped so its accumulator is reclaimed before the next -- safe because both launch on
     // the same stream (serialized).
+    // Route by token width like the MLP shards: T=1 (decode) and small T (MTP verify = draft+1) are
+    // matrix-vector-ish, so the tensor-core MMA wastes its tile -- use the GEMV / SIMT routes; only
+    // wide T (prefill) amortises the MMA. The q4 GEMV (launch_gemv) is shape-generic; the q5 GEMV is
+    // hardcoded to the k=5120 full QKV shapes (n in {6144,7168}), so the n=3584 gate/value shard takes
+    // the SIMT route at small T.
     {
         auto scope = ws.scope();
-        if (q4_volta_mma_supported(qk_out.ne[0], k, t)) {
+        if (t == 1) {
+            launch_q4_gemv_r1_w8_direct(x, query_key_shard, qk_out, stream);
+        } else if (t <= 7) {
+            launch_q4_simt_r8_c4(x, query_key_shard, qk_out, stream);
+        } else if (t >= 16 && q4_volta_mma_supported(qk_out.ne[0], k, t)) {
             launch_q4_volta_mma(x, query_key_shard, qk_out, ws, stream);
         } else {
             launch_q4_simt_r8_c8(x, query_key_shard, qk_out, stream);
@@ -66,7 +75,9 @@ void attn_input_proj_graph_shard_launch(const Tensor& x, const Weight& query_key
     }
     {
         auto scope = ws.scope();
-        if (q5_volta_mma_supported(gv_out.ne[0], k, t)) {
+        if (t <= 7) {
+            launch_q5_simt_r8_c4(x, gate_value_shard, gv_out, stream);
+        } else if (t >= 16 && q5_volta_mma_supported(gv_out.ne[0], k, t)) {
             launch_q5_volta_mma(x, gate_value_shard, gv_out, /*add_residual=*/false,
                                 /*weight_row_offset=*/0, ws, stream);
         } else {
