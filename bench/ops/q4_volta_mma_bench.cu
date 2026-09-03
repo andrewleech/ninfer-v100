@@ -8,6 +8,19 @@
 // a wrong tensor-core fragment map shows up as a mismatch rather than a silent miscompute.
 //
 //   ncu --kernel-name regex:q4_volta_mma_gemm_kernel ... ./ninfer_q4_volta_mma_bench --t-sweep 256
+//
+// RUN IT ON A V100. titan enumerates the RTX A2000 (sm_86) at PCI index 0, so with
+// CUDA_DEVICE_ORDER=PCI_BUS_ID the default device 0 is the A2000, and this sm_70 binary JITs its
+// compute_70 PTX forward onto it -- correct but ~12x slower, which silently masqueraded as a
+// terrible kernel. Pin a V100 with CUDA_VISIBLE_DEVICES=1 (or 2); the startup line below prints the
+// device it actually ran on. Measured on a V100-SXM2-16GB @ locked 1530MHz, kDirect single-split
+// path (matches production shards): gate/up n=16384 k=5120 ~21-22 TFLOP/s, down n=5120 k=8192
+// ~24-25 TFLOP/s across T=256..2048 -- ~20% of the ~112 TFLOP/s fp16/fp32-acc peak. ncu: L1/TEX
+// 84.6%% (top), Compute 46%%, DRAM 25%%, IPC 1.88 -- L1/shared-bound (the shared weight staging),
+// not compute- or issue-bound. Two attempted levers both lost: hoisting the bf16->fp16 activation
+// convert out of the loop = +1%%; register-resident weights (drop the shared buffer, decode each
+// lane's mirrored B row) = -83%% (goes DRAM-bound at 68%% -- the shared staging is what coalesces
+// the scattered per-row weight loads). The kernel is near its practical optimum for this algorithm.
 
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
@@ -127,6 +140,14 @@ int main(int argc, char** argv) {
 
         cudaStream_t stream = nullptr;
         CUDA_CHECK(cudaStreamCreate(&stream));
+
+        int dev = 0;
+        cudaDeviceProp prop{};
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+        std::printf("device %d: %s (sm_%d%d)  -- pin a V100 with CUDA_VISIBLE_DEVICES if this is "
+                    "not a V100\n",
+                    dev, prop.name, prop.major, prop.minor);
 
         DeviceBuffer x = bench::make_bf16(static_cast<std::size_t>(k) * max_t);
         DeviceBuffer out_mma(static_cast<std::size_t>(n) * max_t * 2);
