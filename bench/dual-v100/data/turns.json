@@ -1,0 +1,22 @@
+[
+ {"t":1,"type":"verify","q":"You are working inside this CUDA LLM inference engine. In the file q4_volta_dp4a_gemm.cuh, the struct Q4VoltaDp4aSchedule defines the per-CTA output tile. State the integer values of kTileN and kTileT.",
+  "gold":["64","128"]},
+ {"t":2,"type":"verify","q":"Good. That same kernel stages the weight tile in shared memory padded to a stride called kStrideW. What is kStrideW's numeric value, and in one sentence why is it that specific (odd) number?",
+  "gold":["17"],"kw":["conflict","bank"]},
+ {"t":3,"type":"verify","q":"Now trace the dispatch. In q4_linear_swiglu_graph_shard.cu the wide-T prefill path routes the gate/up GEMM to the dp4a kernel only above a token-width threshold. Name the constant and give its value.",
+  "gold":["kQ4Dp4aMinT","128"]},
+ {"t":4,"type":"verify","q":"So if a prefill chunk is 2048 tokens wide, which route does the MLP gate/up shard take at that width — the int8 dp4a kernel or the fp16 mma kernel? Justify strictly from the threshold you just named.",
+  "gold":["dp4a"],"kw":["2048","128"]},
+ {"t":5,"type":"verify","q":"Switch to the Q5 weight format. In q5_rowsplit_storage.cuh, struct Q5RowSplitStorage, how many code bytes and how many high-plane bytes are defined per 64-element group?",
+  "gold":["32","8"]},
+ {"t":6,"type":"verify","q":"In q5_volta_dp4a_gemm.cuh the 5-bit weight for column index K needs its top bit from that 8-byte high plane. Give the exact expression, in terms of the high byte array indexed by K/8 and shifted by K%8, that extracts weight K's high bit.",
+  "gold":["K/8"],"kw":["%8",">>","1"]},
+ {"t":7,"type":"open","q":"Why is q5_volta_dp4a_gemm_kernel declared with __launch_bounds__(kThreads, 2)? What concrete problem does forcing that second resident block solve, versus letting the compiler choose?",
+  "kw":["occupancy","register","1 block","2 block"]},
+ {"t":8,"type":"verify","q":"Write the exact C++ boolean guard that q4_q5_attn_input_graph_shard.cu uses in its else-if to select the Q4 dp4a route for the query_key projection at wide T. Reproduce the condition faithfully.",
+  "gold":["kQ4Dp4aMinT","q4_volta_dp4a_supported"],"kw":["t >="]},
+ {"t":9,"type":"verify","q":"The MLP down projection (q5_linear_graph_partial.cu) calls launch_q5_volta_dp4a. What value does it pass for add_residual, and in one line why not the other value?",
+  "gold":["false"],"kw":["partial","residual"]},
+ {"t":10,"type":"open","q":"Final synthesis. Across the whole prefill forward, list which quantized GEMMs are now on the dp4a route and which remain on the fp16 mma route, covering the MLP, the attention input projection, and the GDN input projection.",
+  "kw":["gate","down","query_key","gate_value","o_proj","gdn","dp4a","mma"]}
+]

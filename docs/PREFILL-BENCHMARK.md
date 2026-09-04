@@ -3,13 +3,38 @@
 Back-to-back throughput on the **same host, same model, same token counts**, small context
 through near-full 262K. Prefill (prompt processing) and decode (generation).
 
-- **Host:** titan — 2× Tesla V100-SXM2-16GB (Volta sm_70), NVLink.
-- **Model:** Qwen3.8-27B (dense 27B).
-- **ninfer** (this fork): groupwise-int weights (~4.7-bit), **int8 KV**, dual-card tensor-parallel
-  attention (full-262K-capable), `--devices 1,2 --prefill-chunk 2048`.
-- **llama.cpp:** **Q6_K** weights (6.5-bit), **q5_1 KV**, `-sm layer -ts 1/1` (production serving
-  config), `llama-bench` (`-d <depth>` for decode-at-depth).
+- **Host:** titan — 2× Tesla V100-SXM2-16GB (Volta sm_70), NVLink `NV6`, CUDA 12.8, driver 580.
+- **Model:** Qwen3.8-27B (dense 27B), same checkpoint family on both engines.
 - Token counts matched exactly (llama `-p/-d N` = the `N` ninfer reported for each prompt).
+
+### Exact runtime configuration
+
+Both engines run dual-card across the two V100s (`CUDA_DEVICE_ORDER=PCI_BUS_ID`, cards 1,2 — card 0
+is a non-participating RTX A2000). Weights, KV precision, and the **complete** launch command:
+
+**ninfer (this fork)** — `groupwise-int` weights (**~4.7-bit**, artifact `qwen3_8_27b.ninfer`),
+**int8 group-64 KV**, tensor-parallel attention, full-262K-capable:
+
+```bash
+# env: NINFER_TP_ATTENTION=1  NINFER_MLP_PRIMARY=3072
+apps/ninfer /models/Qwen3.8-27B-NInfer/qwen3_8_27b.ninfer --messages <prompt.json> \
+  --greedy --max-new 1 --max-context 262144 --kv-capacity 262144 --kv-dtype int8 \
+  --devices 1,2 --prefill-chunk 2048
+# serve path (production): apps/ninfer-serve <same model> --devices 1,2 --kv-dtype int8 \
+#   --max-context 262144 --kv-capacity 262144 --prefill-chunk 2048  (same forward as the CLI)
+```
+
+**llama.cpp** — **Q6_K** weights (**6.5-bit**, 21.30 GiB, 27.32 B params), **q5_1 K + q5_1 V** KV,
+`-sm layer -ts 1/1` (production layer-split serving config):
+
+```bash
+# env: CUDA_DEVICE_ORDER=PCI_BUS_ID  CUDA_VISIBLE_DEVICES=1,2
+llama-bench -m models/qwen3.8-27b-GGUF/Qwen3.8-27B-Q6_K.gguf -ngl 99 -sm layer -ts 1/1 \
+  -ctk q5_1 -ctv q5_1 -p <N> -n 0 -r 2        # decode: -d <depth> -n 128 ; prefill@221K adds -ub 2048 -b 2048
+```
+
+Version pinned: **[llama.cpp `b10453`](https://github.com/ggml-org/llama.cpp/commit/4df29be4f4c3673f428170fda944a5b19f743bb8)**
+(commit `4df29be4`, 2026-08-16), built for SM_70. All later comparisons use this exact build.
 
 ## ⚠️ Read this before the numbers: the weights are not quant-matched
 
@@ -42,6 +67,11 @@ for the two axes:
 **Parity within ±3 %** across the range (ninfer ahead through the practical 14K–118K mid-range),
 compute-bound and quant-independent. See below for how the gap was closed.
 
+> Prefill tok/s carries ~a few % run-to-run variance (HBM temp / clocks); the numbers above are
+> single-stream single-shot and the two engines were measured in separate sessions, so treat
+> sub-±3 % gaps as ties. Re-measuring the current ninfer build lands within that noise band of these
+> values. The reproducibility pack (`bench/dual-v100/`) has the exact harness.
+
 ## Decode (tok/s, generation at context depth)
 
 | context depth | ninfer raw | ninfer +MTP(3) | llama raw | ninfer-raw vs llama |
@@ -65,6 +95,24 @@ the activation operand is a single shared **broadcast** across the warp — took
 GEMMs from ~21 to ~31–33 TFLOP/s (compute-bound). Correctness: 0.4–0.65 % vs the SIMT oracle
 (expected int8-activation accuracy); dual-card greedy A/B (dp4a on vs off) identical on the cases
 tested including a long-context needle retrieval. See `docs/DUAL-V100-BRINGUP-LOG.md`.
+
+## Serve path: prefill pipelining
+
+The table above is the CLI/`llama-bench` prefill measurement. The production `ninfer-serve` path
+shares the exact same forward (`Engine::submit` → `prefill_impl`) and measures **within run-to-run
+noise of the CLI** at every context size (e.g. ~385 tok/s at 221,592 tokens vs the CLI's ~385–407).
+Prefill here is **device-bound**: the per-2048-token chunk spends ~2.5 s on the GPU and only a small
+fraction of that on host submit, so there is little exposed host time to reclaim.
+
+> **Investigated and rejected — per-chunk barrier "pipelining".** `prefill_impl` issues a
+> `DeviceContext::synchronize()` at the end of every chunk. Skipping it for intermediate chunks (to
+> overlap the next chunk's host submit with the current chunk's device execution) is *correct and
+> bit-identical* — validated, including prompt-cache capture/reuse — but a **rigorous interleaved
+> A/B showed no real speedup**: serve pipe 572.4 s vs barrier 576.2 s at 221,592 tokens (**+0.7 %**,
+> with the pipe runs' own 18 s spread dwarfing the 4 s gap), and the CLI likewise 0–2 % within noise.
+> An earlier non-interleaved measurement that suggested ~+10 % was a **thermal-order artifact** (pipe
+> ran first on cold cards. The exposed host time is genuinely small, so the barrier is not worth
+> removing — the candidate change was reverted (no code shipped).
 
 ### Methodology notes
 
