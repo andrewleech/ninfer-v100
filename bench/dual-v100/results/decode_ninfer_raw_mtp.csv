@@ -1,0 +1,4 @@
+depth_label,prompt_tokens,raw_decode,mtp_decode
+p_00512,476,31.94,59.82
+p_65k,58402,25.44,47.54
+p_131k,117852,20.31,38.71

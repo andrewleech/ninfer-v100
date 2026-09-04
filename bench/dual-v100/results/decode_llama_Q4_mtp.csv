@@ -1,0 +1,4 @@
+prompt,ninfer_tokens,llama_tokens,llama_q4_mtp_decode_tok_s,draft_acceptance,mean_run
+p_00512,476,481,71.04,1.00,4.00
+p_65k,58402,58391,40.17,0.82,3.47
+p_131k,117852,117841,32.62,0.81,3.43

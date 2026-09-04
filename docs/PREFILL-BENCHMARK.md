@@ -48,10 +48,10 @@ for the two axes:
   **~8.6 GB/token** (sharded ~4.7-bit) vs llama's **~21.3 GB/token** (Q6_K), a ~2.5× gap, plus
   int8 vs q5_1 KV. So a **large part of ninfer's decode win is bought with lower weight precision**,
   and it widens at depth as the KV-bandwidth term grows.
-- That lower precision has a **real quality cost on multi-turn / long-context** work that these
-  speed numbers do not capture. A fully apples-to-apples comparison would run llama at a matched
-  weight precision (`Q4_K_M` ~4.8-bit or `Q5_K_M`); prefill should stay ~parity and ninfer's decode
-  lead should shrink toward its real (kernel + KV) size. **TODO: publish the matched-weight run.**
+- The apples-to-apples comparison — llama at matched weight precision (`Q4_K_XL` ~4.5-bit) with MTP —
+  is now published: see [Matched-weight comparison](#matched-weight-comparison-ninfer-vs-llama-q4-mtp-vs-mtp-262k)
+  below. As predicted, prefill stays ~parity and ninfer's decode lead shrinks toward its real size —
+  to ~19 % at deep context — while **quality comes out identical** on the multi-turn agentic test.
 
 ## Prefill (tok/s)
 
@@ -81,9 +81,46 @@ compute-bound and quant-independent. See below for how the gap was closed.
 |       117,852 |   **20.3** |       **38.7** |      14.8 |      **+37 %**      |
 
 ninfer wins raw decode at every depth, widening with context; MTP (self-speculative, draft-3)
-adds ~1.9×. **But per the note above, much of this decode lead reflects the ~2.5× lighter weights,
-not kernel superiority — it is a speed/quality trade.** (llama MTP not measured here; llama.cpp
-also supports speculative decoding.)
+adds ~1.9×. **But this table is not a fair fight on two counts:** (a) llama runs ~2.5× heavier Q6_K
+weights, and (b) it compares ninfer **+MTP** against llama **raw** — llama's MTP never fit alongside
+the full 262K KV on Q6. The matched-weight, **MTP-vs-MTP** rematch is below and is the honest read.
+
+## Matched-weight comparison: ninfer vs llama Q4 (MTP-vs-MTP, 262K)
+
+To remove the weight confound above, the same 27B checkpoint was run as **llama Q4_K_XL** (Unsloth
+Dynamic ~4.5-bit, matched to ninfer's ~4.7-bit) with MTP enabled, versus **ninfer 4.7-bit**, both at
+full 262K. Q4 (5.5 GB lighter than Q6) is what finally lets llama's MTP draft context fit at 262K.
+
+**262K + MTP fit.** A real difference, not just speed:
+
+| engine | KV | 262K + MTP |
+|---|---|---|
+| ninfer | **int8 (8-bit)** | ✅ fits |
+| llama Q4 | q8_0 (8-bit) | ❌ OOM (MTP draft ctx) |
+| llama Q4 | **q5_1 (5-bit)** | ✅ fits (tight) |
+| llama Q6 | any | ❌ MTP never fit |
+
+llama needs to drop to **5-bit** KV to fit MTP at 262K; ninfer fits MTP with **8-bit** KV. So the
+comparison below already gives llama the lighter (lower-precision) KV.
+
+**Quality — identical.** 10-turn agentic real-code benchmark (`bench/dual-v100/`: `codebase_ctx.txt`
++ `turns.json`, thinking on, effort medium, greedy), scored on gold-string hits over 8 verifiable
+turns: **ninfer 100, llama-Q4 100** (and llama-Q6 100). Matched weights do not change accuracy.
+
+**Decode — MTP vs MTP, depth-matched** (same prompts; the two tokenizers agree to <0.1 %):
+
+| context depth | ninfer int8 +MTP | llama-Q4 q5_1 +MTP | winner |
+|--------------:|-----------------:|-------------------:|:------:|
+|          ~476 |             59.8 |           **71.0** | llama +19 % |
+|         ~58 K |         **47.5** |               40.2 | **ninfer +18 %** |
+|        ~118 K |         **38.7** |               32.6 | **ninfer +19 %** |
+
+At matched weights and MTP-vs-MTP, ninfer wins the **deep-context regime (≳35 K crossover)** by
+~18–19 % — the regime this product targets — *while carrying higher-precision (int8) KV*. llama-Q4
+is faster only at short context. (llama-Q4 MTP draft acceptance 0.81–1.00, mean run 3.2–4.0 — MTP is
+genuinely working on both.) So the raw-decode table's big margins shrink to a ~19 % deep-context edge
+once the weights are matched — but the edge, the quality parity, and the fit advantage are real.
+Result artifacts: `bench/dual-v100/results/`.
 
 ## How prefill was closed
 
