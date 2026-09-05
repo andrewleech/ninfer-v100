@@ -305,7 +305,8 @@ std::vector<ParsedUserBlock> parse_user_blocks(const Json& content) {
     return result;
 }
 
-ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSigner& signer) {
+ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSigner& signer,
+                                bool lenient_thinking) {
     ChatTurn assistant;
     assistant.role = ChatRole::Assistant;
     for (std::size_t index = 0; index < content.size(); ++index) {
@@ -322,12 +323,18 @@ ChatTurn parse_assistant_blocks(const Json& content, const AnthropicThinkingSign
             }
             const std::string thinking =
                 require_string(block, "thinking", "messages", "thinking block");
-            if (!block.contains("signature") || !block.at("signature").is_string()) {
-                invalid_thinking_signature();
-            }
-            const std::string signature = block.at("signature").get<std::string>();
-            if (signature.empty() || !signer.verify(thinking, index, signature)) {
-                invalid_thinking_signature();
+            // Lenient mode accepts a thinking block whose signature is absent or not NInfer's own
+            // (e.g. a replayed Claude Code transcript carrying Anthropic signatures) and keeps its
+            // text, matching llama.cpp and the Anthropic API. Strict mode requires an NInfer
+            // signature so a client cannot inject trusted prior reasoning.
+            if (!lenient_thinking) {
+                if (!block.contains("signature") || !block.at("signature").is_string()) {
+                    invalid_thinking_signature();
+                }
+                const std::string signature = block.at("signature").get<std::string>();
+                if (signature.empty() || !signer.verify(thinking, index, signature)) {
+                    invalid_thinking_signature();
+                }
             }
             assistant.reasoning_content += thinking;
         } else if (type == "redacted_thinking") {
@@ -438,7 +445,7 @@ void validate_assistant_tool_ids(const ParsedMessage& message) {
     }
 }
 
-void normalize_tool_history(std::vector<ParsedMessage>& messages) {
+void normalize_tool_history(std::vector<ParsedMessage>& messages, bool lenient) {
     std::vector<std::size_t> result_counts(messages.size(), 0);
     std::vector<bool> paired_result_turn(messages.size(), false);
     for (std::size_t index = 0; index < messages.size(); ++index) {
@@ -455,6 +462,12 @@ void normalize_tool_history(std::vector<ParsedMessage>& messages) {
             continue;
         }
         if (index + 1U >= messages.size() || messages[index + 1U].role != ChatRole::User) {
+            if (lenient) {
+                // Truncated/replayed history: an assistant tool_use with no following user turn to
+                // carry its result (e.g. a prefix slice cut between the call and its result). Leave
+                // the call unpaired; it renders without a result, as llama.cpp/Anthropic allow.
+                continue;
+            }
             invalid_tool_history("tool_result for visible tool_use id '" +
                                  assistant.turn.tool_calls.front().id +
                                  "' must immediately follow its assistant message");
@@ -482,7 +495,7 @@ void normalize_tool_history(std::vector<ParsedMessage>& messages) {
             }
         }
         for (const ToolCall& call : assistant.turn.tool_calls) {
-            if (!result_by_id.contains(call.id)) {
+            if (!lenient && !result_by_id.contains(call.id)) {
                 invalid_tool_history("missing tool_result for visible tool_use id '" + call.id +
                                      "'");
             }
@@ -491,7 +504,12 @@ void normalize_tool_history(std::vector<ParsedMessage>& messages) {
         std::vector<ParsedUserBlock> ordered;
         ordered.reserve(user.user_blocks.size());
         for (const ToolCall& call : assistant.turn.tool_calls) {
-            ordered.push_back(std::move(user.user_blocks[result_by_id.at(call.id)]));
+            // Strict mode guarantees a result per call (checked above), so find == the old at().
+            // Lenient mode may leave a call with no result: it contributes no block.
+            const auto found = result_by_id.find(call.id);
+            if (found != result_by_id.end()) {
+                ordered.push_back(std::move(user.user_blocks[found->second]));
+            }
         }
         for (std::size_t block_index = result_count; block_index < user.user_blocks.size();
              ++block_index) {
@@ -543,7 +561,7 @@ void lower_messages(std::vector<ParsedMessage> messages, GenerationRequest& requ
 }
 
 void parse_messages(const Json& body, GenerationRequest& request,
-                    const AnthropicThinkingSigner& signer) {
+                    const AnthropicThinkingSigner& signer, bool lenient_history) {
     if (!body.contains("messages")) { bad_request("missing required field: messages", "messages"); }
     const Json& messages = body.at("messages");
     if (!messages.is_array() || messages.empty()) {
@@ -614,7 +632,7 @@ void parse_messages(const Json& body, GenerationRequest& request,
             bad_request("message content must be a string or an array", "messages");
         }
         if (role == ChatRole::Assistant) {
-            message.turn = parse_assistant_blocks(content, signer);
+            message.turn = parse_assistant_blocks(content, signer, lenient_history);
         } else {
             message.user_blocks = parse_user_blocks(content);
         }
@@ -622,7 +640,7 @@ void parse_messages(const Json& body, GenerationRequest& request,
     }
 
     parsed = normalize_same_role_messages(std::move(parsed));
-    normalize_tool_history(parsed);
+    normalize_tool_history(parsed, lenient_history);
     lower_messages(std::move(parsed), request);
 
     if (!request.messages.empty() && request.messages.back().role == ChatRole::Assistant) {
@@ -1011,13 +1029,36 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
                       .ttl      = *automatic_ttl};
 }
 
+// GGUF/vLLM-parity: the previous llama.cpp deployment honored
+// chat_template_kwargs.enable_thinking; NInfer's own levers are thinking:{type:...} and
+// output_config.effort:"none". Map the kwarg to enable_thinking only when neither native control
+// was given, so it can never conflict with an explicit thinking/effort field.
+void parse_chat_template_kwargs(const Json& body, GenerationRequest& request) {
+    if (request.enable_thinking.has_value() || request.reasoning_effort.has_value()) { return; }
+    if (!body.contains("chat_template_kwargs") || body.at("chat_template_kwargs").is_null()) {
+        return;
+    }
+    const Json& kwargs = body.at("chat_template_kwargs");
+    if (!kwargs.is_object() || !kwargs.contains("enable_thinking") ||
+        kwargs.at("enable_thinking").is_null()) {
+        return;
+    }
+    if (!kwargs.at("enable_thinking").is_boolean()) {
+        bad_request("chat_template_kwargs.enable_thinking must be a boolean",
+                    "chat_template_kwargs.enable_thinking");
+    }
+    request.enable_thinking = kwargs.at("enable_thinking").get<bool>();
+}
+
 void parse_common_prompt(const Json& body, GenerationRequest& request, ParsePurpose purpose,
-                         int effective_max_tokens, const AnthropicThinkingSigner& signer) {
+                         int effective_max_tokens, const AnthropicThinkingSigner& signer,
+                         bool lenient_history) {
     lower_tools(body, request);
     parse_system(body, request);
-    parse_messages(body, request, signer);
+    parse_messages(body, request, signer, lenient_history);
     parse_thinking(body, request, purpose, effective_max_tokens);
     parse_effort(body, request, purpose);
+    parse_chat_template_kwargs(body, request);
     apply_anthropic_prompt_cache_policy(body, request);
     if (body.contains("container") && !body.at("container").is_null()) {
         bad_request("container requires an external execution environment that NInfer does not "
@@ -1058,19 +1099,20 @@ AnthropicMessagesRequest parse_anthropic_messages_request(const Json& body,
     }
 
     parse_common_prompt(body, result.generation, ParsePurpose::Messages,
-                        result.generation.max_tokens, signer);
+                        result.generation.max_tokens, signer, limits.lenient_history);
     parse_generation_fields(body, result.generation);
     return result;
 }
 
 AnthropicCountTokensRequest
-parse_anthropic_count_tokens_request(const Json& body, const AnthropicThinkingSigner& signer) {
+parse_anthropic_count_tokens_request(const Json& body, const AnthropicThinkingSigner& signer,
+                                     bool lenient_history) {
     require_object(body);
     AnthropicCountTokensRequest result;
     result.model                           = parse_model(body);
     result.generation.tool_name_max_length = kMaxToolNameLength;
     parse_common_prompt(body, result.generation, ParsePurpose::CountTokens,
-                        std::numeric_limits<int>::max(), signer);
+                        std::numeric_limits<int>::max(), signer, lenient_history);
     return result;
 }
 

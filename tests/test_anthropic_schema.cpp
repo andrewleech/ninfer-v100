@@ -53,6 +53,13 @@ AnthropicMessagesRequest parse(const Json& body) {
     return parse_anthropic_messages_request(body, limits(), thinking_signer());
 }
 
+AnthropicMessagesRequest parse_lenient(const Json& body) {
+    RequestLimits value;
+    value.default_max_tokens = 8192;
+    value.lenient_history    = true;
+    return parse_anthropic_messages_request(body, value, thinking_signer());
+}
+
 std::string api_code(const std::function<void()>& action) {
     try {
         action();
@@ -484,6 +491,86 @@ int test_thinking_history_integrity() {
     return failures;
 }
 
+int test_lenient_history() {
+    int failures = 0;
+
+    // (a) A thinking block carrying a foreign (non-NInfer) signature — as every replayed Claude
+    // Code transcript does — is rejected by default but accepted under lenient mode, keeping its
+    // text, matching llama.cpp and the Anthropic API.
+    Json foreign        = base_request();
+    foreign["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "before"}},
+         Json{{"role", "assistant"},
+              {"content", Json::array({Json{{"type", "thinking"},
+                                            {"thinking", "imported reasoning"},
+                                            {"signature", "sig_from_another_provider"}},
+                                       Json{{"type", "text"}, {"text", "answer"}}})}},
+         Json{{"role", "user"}, {"content", "after"}}});
+    failures += check(api_code([&] { (void)parse(foreign); }) == "invalid_thinking_signature",
+                      "strict mode unexpectedly accepted a foreign thinking signature");
+    const GenerationRequest foreign_ok = parse_lenient(foreign).generation;
+    failures += check(foreign_ok.messages.size() == 3 &&
+                          foreign_ok.messages[1].reasoning_content == "imported reasoning" &&
+                          foreign_ok.messages[1].content[0].text == "answer",
+                      "lenient mode did not accept a foreign-signed thinking block");
+    Json unsigned_thought = foreign;
+    unsigned_thought["messages"][1]["content"][0].erase("signature");
+    failures += check(!parse_lenient(unsigned_thought).generation.messages[1].reasoning_content.empty(),
+                      "lenient mode did not accept an unsigned thinking block");
+
+    // (b) An assistant tool_use whose tool_result was cut off by a history slice (cc-local-compact's
+    // exact repro) is rejected by default but accepted under lenient — the unpaired call is kept and
+    // the following user text preserved.
+    Json missing_result        = base_request();
+    missing_result["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "hi"}},
+         Json{{"role", "assistant"}, {"content", Json::array({tool_use("toolu_a")})}},
+         Json{{"role", "user"}, {"content", "say ok"}}});
+    failures += check(api_code([&] { (void)parse(missing_result); }) == "invalid_tool_history",
+                      "strict mode unexpectedly accepted a missing tool_result");
+    const GenerationRequest unpaired = parse_lenient(missing_result).generation;
+    failures += check(unpaired.messages.size() == 3 &&
+                          unpaired.messages[1].role == ninfer::ChatRole::Assistant &&
+                          unpaired.messages[1].tool_calls.size() == 1 &&
+                          unpaired.messages[1].tool_calls[0].id == "toolu_a" &&
+                          unpaired.messages[2].role == ninfer::ChatRole::User &&
+                          unpaired.messages[2].content[0].text == "say ok",
+                      "lenient mode did not accept an unpaired assistant tool_use");
+    failures += check(api_code([&] {
+                          (void)parse_anthropic_count_tokens_request(missing_result,
+                                                                     thinking_signer(), true);
+                      }).empty(),
+                      "lenient Count Tokens rejected an unpaired tool_use");
+
+    // A partially-paired turn (one of two calls has a result) is accepted under lenient: the matched
+    // result is associated, the unmatched call renders result-less.
+    Json partial        = base_request();
+    partial["messages"] = Json::array(
+        {Json{{"role", "assistant"},
+              {"content", Json::array({tool_use("toolu_a"), tool_use("toolu_b")})}},
+         Json{{"role", "user"}, {"content", Json::array({tool_result("toolu_a", "A")})}}});
+    const GenerationRequest partial_ok = parse_lenient(partial).generation;
+    failures += check(partial_ok.messages[0].tool_calls.size() == 2 &&
+                          partial_ok.messages[1].role == ninfer::ChatRole::Tool &&
+                          partial_ok.messages[1].tool_call_id == "toolu_a",
+                      "lenient mode mishandled a partially-paired tool turn");
+
+    // (c) chat_template_kwargs.enable_thinking (GGUF/vLLM parity) is honored when no native thinking
+    // control is present, and yields to an explicit native thinking field.
+    Json kwarg                   = base_request();
+    kwarg["chat_template_kwargs"] = Json{{"enable_thinking", false}};
+    const GenerationRequest kwarg_req = parse(kwarg).generation;
+    failures += check(kwarg_req.enable_thinking.has_value() && *kwarg_req.enable_thinking == false,
+                      "chat_template_kwargs.enable_thinking was not honored");
+    Json kwarg_override        = kwarg;
+    kwarg_override["thinking"] = Json{{"type", "adaptive"}};
+    const GenerationRequest kwarg_override_req = parse(kwarg_override).generation;
+    failures += check(kwarg_override_req.enable_thinking.has_value() &&
+                          *kwarg_override_req.enable_thinking == true,
+                      "native thinking field did not override chat_template_kwargs");
+    return failures;
+}
+
 int test_content_and_cache_hints() {
     Json body                       = base_request();
     body["cache_control"]           = Json{{"type", "ephemeral"}, {"ttl", "5m"}};
@@ -671,6 +758,7 @@ int main() {
     failures += test_tools();
     failures += test_thinking_and_count_tokens();
     failures += test_thinking_history_integrity();
+    failures += test_lenient_history();
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();
     failures += test_stream();

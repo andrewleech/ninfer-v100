@@ -17,8 +17,8 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     const std::string request_id = new_anthropic_request_id();
     res.set_header("request-id", request_id);
     try {
-        const AnthropicCountTokensRequest request =
-            parse_anthropic_count_tokens_request(parse_json_body(req), anthropic_thinking_signer_);
+        const AnthropicCountTokensRequest request = parse_anthropic_count_tokens_request(
+            parse_json_body(req), anthropic_thinking_signer_, options_.anthropic_lenient_history);
         const int input_tokens = service_->count_prompt_tokens(
             request.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_anthropic_count_tokens_response(input_tokens), "application/json");
@@ -40,6 +40,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.lenient_history    = options_.anthropic_lenient_history;
         request                   = parse_anthropic_messages_request(parse_json_body(req), limits,
                                                                      anthropic_thinking_signer_);
     } catch (const ApiException& exception) {

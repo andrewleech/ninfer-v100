@@ -54,6 +54,12 @@ struct ServeOptions {
     std::optional<std::uint32_t> default_thinking_budget;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
+    // Accept foreign/truncated Anthropic conversation history: thinking blocks whose signature is
+    // not NInfer's own (e.g. Claude Code transcripts carrying Anthropic signatures), and an
+    // assistant tool_use with no matching tool_result (a history slice that cut between a call and
+    // its result). Both llama.cpp and the Anthropic API accept these; NInfer rejects them by
+    // default. Enable for replay/summariser workloads that feed back sliced foreign transcripts.
+    bool anthropic_lenient_history = false;
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.
     SamplingOverrides sampling_overrides;

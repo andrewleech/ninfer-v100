@@ -45,6 +45,9 @@ private:
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
     int default_max_tokens = 8192;
+    // Accept foreign-signed thinking blocks and an unpaired assistant tool_use (truncated/replayed
+    // history). Sourced from ServeOptions::anthropic_lenient_history. See serve_options.h.
+    bool lenient_history = false;
 };
 
 enum class ContentKind {
