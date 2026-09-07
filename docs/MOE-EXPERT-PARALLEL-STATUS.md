@@ -73,19 +73,32 @@ Commit `d099f2f4`. The expert-parallel partial now runs the **grouped-prefill** 
   121 tok/s**, and — the P2 milestone — **zero bad_alloc** where P1 could not run the grouped path.
   5-lens adversarial review (reduce-math, memory-safety, arena, single-card-noop, epilogue) clean.
 
-**MTP EP — assessed, NOT yet done (deferrable).** `Variant::mtp_post_mixer` calls single-card
-`run_sparse_moe` (full 256 W8/W8 experts on the primary), not `run_sparse_moe_graph`. MTP already
-loads + works this way (the MTP experts are in the 19.6 GB artifact, on card 1). MTP EP would shard
-the MTP MoE too (halve its compute + ~384 MB primary VRAM), but MTP is **single-stream only** (off
-under the concurrency EP targets, and off in the benchmark parity), so it is **off the throughput
-critical path**. Fold into a later pass if single-stream MTP-on decode becomes a goal.
+## MTP EP — DONE + VALIDATED (2026-09-07)
+Commit `c2f50f05`. The MTP (self-speculative draft) MoE is now expert-parallel too, so all three MoE
+passes on the 35B (main layer, grouped-prefill, MTP) shard the routed experts 128/128.
+
+- `bindings.cpp` shards the MTP routed banks (W8/W8, same 256-expert geometry, RowBand 131072/262144)
+  under `graph_parallel && features.mtp()`; `load_moe` then populates `secondary_op`. MTP experts
+  128-255 move off the primary onto card 1 (~384 MB).
+- Both MTP post-mixer sites route through `run_sparse_moe_graph` when `graph_parallel_active()`, else
+  single-card. Guarded by `if constexpr (supports_graph_parallel && graph_parallel_post_mixer_is_moe)`
+  so it is discarded for the 27B dense MTP payload. **Compile trap:** a non-dependent `.has_secondary`
+  access is ill-formed in the discarded branch for the dense payload — mirror `mlp_tail` and never
+  touch a payload member in the guard (the shard is always bound when graph_parallel+mtp anyway).
+  W8/W8 is not grouped-prefill-eligible on Volta, so MTP reuses P1's decode/small-T EP kernels.
+- `mtp_post_mixer_workspace_capacity_bytes` models the 2 EP partials + leaf.
+- **Validated (`--devices 1,2 --spec mtp --draft-tokens 4`):** MTP experts sharded (card 2 9567 MiB,
+  +408 MB), zero bad_alloc, **decode 175.7 tok/s with MTP vs 121 no-MTP (1.45×)**, acceptance 74.6% /
+  3.94 tok/round / 0 fallback. Greedy output **bit-identical to the no-MTP run** — the correctness
+  cross-check self-speculation must pass. 3-lens adversarial review clean.
 
 ## Next
-- **P3:** build the harness above, then a coordinated back-to-back both-cards window vs llama.cpp
-  (depth×B grid, ~180K-centric, MTP-OFF parity), scheduled with claude-net `titan-router`. This is
-  what measures the grouped-prefill EP win the user asked for ("measured properly at different depths").
+- **P3:** build the harness above, then a coordinated both-cards window vs llama.cpp. **Sweep depth
+  ALL THE WAY TO 262K** (user requirement, 2026-09-07) — not just ~180K. Measure **with MTP** (user
+  wants MTP included, not MTP-OFF-only). ninfer legs: MTP-on and MTP-off; llama legs where its draft
+  fits (its MTP OOMs near 262K, so note where it falls back). Scheduled with `titan-router` (stops
+  llama-swap for a guaranteed window — worked twice now).
 - **P4:** `serve-ninfer-35b-v100.sh` (dual-card, `--max-concurrency`) + model-router cutover.
-- **Deferred:** MTP EP (above) — single-stream-only, not on the benchmark critical path.
 
 **GPU access:** always coordinate a BOTH-cards window with claude-net `titan-router` — llama-swap
 auto-spawns models on inbound requests, so a card can be reclaimed mid-window.
