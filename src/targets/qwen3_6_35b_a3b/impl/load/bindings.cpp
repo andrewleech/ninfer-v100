@@ -162,7 +162,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         // Expert-parallel MoE: card 0 gets experts 0-127, card 1 experts 128-255. routed_gate_up
         // [262144,2048] splits at row 128*1024=131072; routed_down [524288,512] at row 128*2048=
         // 262144. Router / shared expert / attention / GDN / embeddings / head stay unsharded
-        // (primary-only). MTP moe stays whole (a separate forward pass; single-card).
+        // (primary-only). The MTP moe has the same geometry and is sharded the same way below (once
+        // its plan is bound), so the MTP post-mixer also runs expert-parallel.
         constexpr std::uint64_t kGateUpExpertSplit = 131072;  // 128 experts * (gate512 + up512)
         constexpr std::uint64_t kDownExpertSplit   = 262144;  // 128 experts * hidden2048
         for (const TextLayerPlan& layer : out.text_layers) {
@@ -211,6 +212,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {2048});
     out.mtp.moe        = bind_moe(binder, "mtp/layer/moe/", NumericFormat::W8G32_F16S,
                                   NumericFormat::W8G32_F16S, mtp_placement);
+    if (graph_parallel && features.mtp()) {
+        // Same 256-expert geometry as the text-layer MoE (W8/W8 codec), sharded 128/128 the same way
+        // so run_sparse_moe_graph can drive the MTP post-mixer expert-parallel too. This also frees
+        // ~experts-128-255 of the MTP banks off the primary (they move to card 1's weights arena).
+        binder.shard_row_split_across_devices(out.mtp.moe.routed_gate_up,
+                                              artifact::RowSplitShardAxis::RowBand, 131072);
+        binder.shard_row_split_across_devices(out.mtp.moe.routed_down,
+                                              artifact::RowSplitShardAxis::RowBand, 262144);
+    }
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
 
     const artifact::TensorPlacement vision_placement =

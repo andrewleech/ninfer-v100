@@ -335,8 +335,19 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
                                                              std::int32_t last) {
-    return ops::sparse_moe_workspace_capacity_bytes(QType::W8G32_F16S, QType::W8G32_F16S, first,
-                                                    last);
+    // The MTP MoE is also expert-parallel (W8/W8, sharded 128/128) and driven by the same
+    // run_sparse_moe_graph, so its reservation must budget the two live [hidden,last] EP partials on
+    // top of the sparse-MoE leaf, mirroring the graph's alloc order (see post_mixer_workspace_...).
+    const std::size_t leaf =
+        ops::sparse_moe_workspace_capacity_bytes(QType::W8G32_F16S, QType::W8G32_F16S, first, last);
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last}); // primary_partial
+    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last}); // peer_partial
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(leaf);
+    }
+    return layout.peak_bytes(1);
 }
 
 } // namespace ninfer::targets::qwen3_6_35b_a3b::detail

@@ -423,7 +423,20 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
 
     {
         auto post_mixer_scope = work_.scope();
-        Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x, work_, s);
+        // Only the 35B has a sparse-MoE MTP post-mixer (graph_parallel_post_mixer_is_moe); route it
+        // through the EP graph when dual-card (the MTP experts are always sharded when graph_parallel
+        // + mtp). Mirror mlp_tail exactly — never touch a payload member here, so the discarded branch
+        // stays well-formed for the 27B's dense MTP payload.
+        if constexpr (Variant::supports_graph_parallel &&
+                      Variant::graph_parallel_post_mixer_is_moe) {
+            if (graph_parallel_active()) {
+                run_sparse_moe_graph(mh, mtp_.payload->post_mixer, x, T);
+            } else {
+                Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x, work_, s);
+            }
+        } else {
+            Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x, work_, s);
+        }
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({kCfg.hidden, T});
@@ -554,7 +567,16 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::rmsnorm(x_last, *mtp_.post_attn_norm, kCfg.rms_eps, true, mh, s);
         {
             auto post_mixer_scope = work_.scope();
-            Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x_last, work_, s);
+            if constexpr (Variant::supports_graph_parallel &&
+                          Variant::graph_parallel_post_mixer_is_moe) {
+                if (graph_parallel_active()) {
+                    run_sparse_moe_graph(mh, mtp_.payload->post_mixer, x_last, 1);
+                } else {
+                    Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x_last, work_, s);
+                }
+            } else {
+                Variant::mtp_post_mixer(mh, mtp_.payload->post_mixer, x_last, work_, s);
+            }
         }
         ops::rmsnorm(x_last, *mtp_.norm, kCfg.rms_eps, true, *final_hidden, s);
         proposal_argmax(*final_hidden, *logits, *draft_token);
