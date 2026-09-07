@@ -354,16 +354,11 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
 std::size_t sparse_moe_partial_workspace_capacity_bytes(QType routed_gate_up, QType routed_down,
                                                         std::int32_t min_tokens,
                                                         std::int32_t max_tokens) {
-    // The partial path runs ONLY decode + (chunked) small-T kernels, never grouped prefill. Bounding
-    // by the full prefill-inclusive sparse_moe workspace over-reserves this leaf; combined with the
-    // two live [hidden,T] partial buffers run_sparse_moe_graph holds from the SAME arena, that
-    // over-commits the arena and trips DeviceArena::alloc_bytes' std::bad_alloc on the dual-card
-    // prefill EP path. Cap the interval to the small-T band (prefill_first > kSparseMoeSmallTMax for
-    // the routed Q4/Q5-Q6 profiles the partial path uses), which drops the ~41MB grouped-prefill
-    // scratch and leaves the prefill-sized post-mixer reservation ample slack for the two partials.
-    const std::int32_t capped_max = std::min(max_tokens, detail::kSparseMoeSmallTMax);
-    const std::int32_t capped_min = std::min(min_tokens, capped_max);
-    return sparse_moe_workspace_capacity_bytes(routed_gate_up, routed_down, capped_min, capped_max);
+    // The partial path (Volta) runs the same grouped-prefill kernels as sparse_moe for T >= 47, so it
+    // needs the full prefill-inclusive workspace. The arena reservation that backs this leaf budgets
+    // the two live [hidden,T] EP partials on top (see the 35B post_mixer_workspace_capacity_bytes),
+    // so returning the true capacity no longer over-commits.
+    return sparse_moe_workspace_capacity_bytes(routed_gate_up, routed_down, min_tokens, max_tokens);
 }
 
 void sparse_moe_partial(const Tensor& x, const SparseMoeWeights& weights, const SparseMoeShard& shard,
@@ -384,15 +379,31 @@ void sparse_moe_partial(const Tensor& x, const SparseMoeWeights& weights, const 
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
     validate_weights_partial(weights, shard, ranges);
 
-    // Expert-parallel never uses the grouped prefill kernel; T>46 is chunked through small-T so every
-    // token remains exact (the grouped prefill EP path is out of scope for P1).
+    // On Volta the partial path runs the grouped prefill kernels for T >= 47 (each card owns half the
+    // experts), which is the throughput lever for long prefill; smaller T stays on decode/small-T.
+    // Off Volta the grouped prefill EP merge is not wired, so T>46 is chunked through small-T (exact,
+    // just slower) — titan is Volta so this is the hot path.
     const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
-    const bool use_chunked = tokens > detail::kSparseMoeSmallTMax;
-    nvtx::ScopedRange moe_range(use_small_t ? nvtx::Name::SparseMoeSmallT
-                                            : nvtx::Name::SparseMoeDecode,
+#ifdef NINFER_VOLTA_BUILD
+    const bool use_prefill = volta_prefill_supported(weights.routed_gate_up.qtype,
+                                                     weights.routed_down.qtype) &&
+                             detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
+                                                             weights.routed_down.qtype);
+    const bool use_chunked = !use_prefill && tokens > detail::kSparseMoeSmallTMax;
+#else
+    constexpr bool use_prefill = false;
+    const bool use_chunked     = tokens > detail::kSparseMoeSmallTMax;
+#endif // NINFER_VOLTA_BUILD
+    nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
+                                : use_small_t ? nvtx::Name::SparseMoeSmallT
+                                              : nvtx::Name::SparseMoeDecode,
                                 nvtx::Category::Moe, static_cast<std::uint64_t>(tokens));
     std::size_t required = 0;
-    if (use_chunked) {
+    if (use_prefill) {
+        required = detail::resolve_sparse_moe_prefill_plan(tokens, weights.routed_gate_up.qtype,
+                                                           weights.routed_down.qtype)
+                       .workspace_bytes;
+    } else if (use_chunked) {
         required = detail::resolve_sparse_moe_small_t_plan(detail::kSparseMoeSmallTMax,
                                                            weights.routed_gate_up.qtype,
                                                            weights.routed_down.qtype)
@@ -414,6 +425,14 @@ void sparse_moe_partial(const Tensor& x, const SparseMoeWeights& weights, const 
     require_disjoint(ranges);
 
     auto scope = workspace.scope();
+    if (use_prefill) {
+        const detail::SparseMoePrefillPlan plan = detail::resolve_sparse_moe_prefill_plan(
+            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+        const detail::SparseMoePrefillWorkspace views =
+            detail::allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens);
+        detail::sparse_moe_prefill_launch(x, weights, destination, plan, views, stream, shard);
+        return;
+    }
     if (use_chunked) {
         for (std::int32_t begin = 0; begin < tokens; begin += detail::kSparseMoeSmallTMax) {
             const std::int32_t count = std::min(detail::kSparseMoeSmallTMax, tokens - begin);

@@ -314,10 +314,23 @@ std::size_t Variant::gdn_norm_control_projection_workspace_capacity_bytes(std::i
 
 std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile, qwen3_6::TextPhase,
                                                          std::int32_t first, std::int32_t last) {
-    return std::max(
+    // The 35B MoE is always dual-card expert-parallel: run_sparse_moe_graph keeps two live [hidden,
+    // last] bf16 partials (this card's + the peer landing buffer) in the SAME arena scope as the
+    // sparse-MoE leaf, then reduces them into the residual over NVLink. Unlike a dense MLP the leaf
+    // is identical single-card vs sharded (grouped_io is sized by tokens, not expert count), so there
+    // is no slack to absorb the partials — model them explicitly, mirroring the graph's allocation
+    // order, or the grouped-prefill partial trips the arena's bad_alloc.
+    const std::size_t leaf = std::max(
         ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q5G64_F16S, first, last),
-        ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q6G64_F16S, first,
-                                                 last));
+        ops::sparse_moe_workspace_capacity_bytes(QType::Q4G64_F16S, QType::Q6G64_F16S, first, last));
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last}); // primary_partial
+    (void)layout.alloc(DType::BF16, {TextConfig::hidden, last}); // peer_partial
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(leaf);
+    }
+    return layout.peak_bytes(1);
 }
 
 std::size_t Variant::mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,

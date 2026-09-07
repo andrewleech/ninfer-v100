@@ -99,8 +99,14 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
 [[nodiscard]] SparseMoePrefillPlan
 resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down);
 
+// shard defaults to the whole 256-expert set with the shared expert and the residual add (a strict
+// specialization of the single-card path). A subset shard [expert_lo,expert_hi) with add_residual =
+// false runs the dual-card expert-parallel partial: the routed banks are the compacted shard, the
+// shared expert + residual are the owning (primary) card's, and the destination receives this card's
+// weighted partial for the orchestrator to reduce over NVLink.
 void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
-                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream);
+                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
+                               SparseMoeShard shard = {});
 
 } // namespace ninfer::ops::detail
