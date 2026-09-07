@@ -747,8 +747,12 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
 
     // Opt-in NVLink tensor-parallel attention. Matches the load-side gate in the 27b package
     // (dual-device graph mode + the NINFER_TP_ATTENTION dev toggle); confined to variants that
-    // declare graph-parallel support so the single-card 35b path is never affected.
-    const bool tp_attention = Variant::supports_graph_parallel && options.devices.size() == 2 &&
+    // declare graph-parallel ATTENTION support. The 35B sets supports_graph_parallel for its MoE
+    // reduce but keeps graph_parallel_attention=false (attention stays single-card in P1); gating on
+    // the attention-specific trait keeps the 27B identical and stops the 35B from ever halving its
+    // KV pool while attention still computes the full kv_heads.
+    const bool tp_attention = Variant::supports_graph_parallel && Variant::graph_parallel_attention &&
+                              options.devices.size() == 2 &&
                               std::getenv("NINFER_TP_ATTENTION") != nullptr;
 
     SequencePlanningInputs inputs{

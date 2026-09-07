@@ -354,9 +354,16 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
 std::size_t sparse_moe_partial_workspace_capacity_bytes(QType routed_gate_up, QType routed_down,
                                                         std::int32_t min_tokens,
                                                         std::int32_t max_tokens) {
-    // The partial path only uses the decode / small-T (and chunked small-T) kernels, never the
-    // grouped prefill kernel, so the full sparse_moe workspace is a safe upper bound.
-    return sparse_moe_workspace_capacity_bytes(routed_gate_up, routed_down, min_tokens, max_tokens);
+    // The partial path runs ONLY decode + (chunked) small-T kernels, never grouped prefill. Bounding
+    // by the full prefill-inclusive sparse_moe workspace over-reserves this leaf; combined with the
+    // two live [hidden,T] partial buffers run_sparse_moe_graph holds from the SAME arena, that
+    // over-commits the arena and trips DeviceArena::alloc_bytes' std::bad_alloc on the dual-card
+    // prefill EP path. Cap the interval to the small-T band (prefill_first > kSparseMoeSmallTMax for
+    // the routed Q4/Q5-Q6 profiles the partial path uses), which drops the ~41MB grouped-prefill
+    // scratch and leaves the prefill-sized post-mixer reservation ample slack for the two partials.
+    const std::int32_t capped_max = std::min(max_tokens, detail::kSparseMoeSmallTMax);
+    const std::int32_t capped_min = std::min(min_tokens, capped_max);
+    return sparse_moe_workspace_capacity_bytes(routed_gate_up, routed_down, capped_min, capped_max);
 }
 
 void sparse_moe_partial(const Tensor& x, const SparseMoeWeights& weights, const SparseMoeShard& shard,
