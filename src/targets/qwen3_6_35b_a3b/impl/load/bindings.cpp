@@ -59,19 +59,36 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
 
 SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtifact& materialized,
                           NumericFormat routed_gate_up, NumericFormat routed_down) {
-    return SparseMoePayload{
-        .op = {
-            .router_shared_gate = artifact::materialized_weight(
-                materialized, plan.router_shared_gate, NumericFormat::BF16, 257, 2048),
-            .routed_gate_up = artifact::materialized_weight(materialized, plan.routed_gate_up,
-                                                            routed_gate_up, 262144, 2048),
-            .routed_down    = artifact::materialized_weight(materialized, plan.routed_down,
-                                                            routed_down, 524288, 512),
-            .shared_gate_up = artifact::materialized_weight(materialized, plan.shared_gate_up,
-                                                            NumericFormat::W8G32_F16S, 1024, 2048),
-            .shared_down    = artifact::materialized_weight(materialized, plan.shared_down,
-                                                            NumericFormat::W8G32_F16S, 2048, 512),
-        }};
+    // Expert-parallel split: when the routed banks were sharded across two cards, rank 0 holds
+    // experts 0-127 (131072 gate_up rows / 262144 down rows) and rank 1 holds experts 128-255. A
+    // single-card (or MTP, never sharded) load keeps the whole 256-expert banks on rank 0.
+    const bool dual              = materialized.has_device_data(plan.routed_gate_up, 1);
+    const std::int32_t gate_rows = dual ? 131072 : 262144;
+    const std::int32_t down_rows = dual ? 262144 : 524288;
+    SparseMoePayload out;
+    out.op = {
+        .router_shared_gate = artifact::materialized_weight(materialized, plan.router_shared_gate,
+                                                            NumericFormat::BF16, 257, 2048),
+        .routed_gate_up = artifact::materialized_weight(materialized, plan.routed_gate_up,
+                                                        routed_gate_up, gate_rows, 2048),
+        .routed_down    = artifact::materialized_weight(materialized, plan.routed_down, routed_down,
+                                                        down_rows, 512),
+        .shared_gate_up = artifact::materialized_weight(materialized, plan.shared_gate_up,
+                                                        NumericFormat::W8G32_F16S, 1024, 2048),
+        .shared_down    = artifact::materialized_weight(materialized, plan.shared_down,
+                                                        NumericFormat::W8G32_F16S, 2048, 512),
+    };
+    if (dual) {
+        out.has_secondary = true;
+        // Rank-1 routed shards (experts 128-255, compacted to local row 0). Router/shared alias the
+        // rank-0 copies; the rank-1 kernels reach them over UVA peer access (small, read-once).
+        out.secondary_op                    = out.op;
+        out.secondary_op.routed_gate_up     = artifact::materialized_weight(
+            materialized, plan.routed_gate_up, routed_gate_up, 131072, 2048, /*device_rank=*/1);
+        out.secondary_op.routed_down        = artifact::materialized_weight(
+            materialized, plan.routed_down, routed_down, 262144, 512, /*device_rank=*/1);
+    }
+    return out;
 }
 
 void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle handle) {
@@ -94,7 +111,8 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 } // namespace
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features) {
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               bool graph_parallel) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
     out.frontend        = qwen3_6::bind_frontend_resources(binder);
@@ -138,6 +156,22 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {2048});
         target.moe = bind_moe(binder, prefix + "moe/", NumericFormat::Q4G64_F16S,
                               routed_down_format(layer), artifact::TensorPlacement::Device);
+    }
+
+    if (graph_parallel) {
+        // Expert-parallel MoE: card 0 gets experts 0-127, card 1 experts 128-255. routed_gate_up
+        // [262144,2048] splits at row 128*1024=131072; routed_down [524288,512] at row 128*2048=
+        // 262144. Router / shared expert / attention / GDN / embeddings / head stay unsharded
+        // (primary-only). MTP moe stays whole (a separate forward pass; single-card).
+        constexpr std::uint64_t kGateUpExpertSplit = 131072;  // 128 experts * (gate512 + up512)
+        constexpr std::uint64_t kDownExpertSplit   = 262144;  // 128 experts * hidden2048
+        for (const TextLayerPlan& layer : out.text_layers) {
+            binder.shard_row_split_across_devices(layer.moe.routed_gate_up,
+                                                  artifact::RowSplitShardAxis::RowBand,
+                                                  kGateUpExpertSplit);
+            binder.shard_row_split_across_devices(
+                layer.moe.routed_down, artifact::RowSplitShardAxis::RowBand, kDownExpertSplit);
+        }
     }
 
     out.final_norm =
@@ -228,6 +262,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     runtime.weights_arena = &backing.device_arena();
+    runtime.secondary_weights_arena =
+        backing.device_arena_count() > 1 ? &backing.device_arena(1) : nullptr;
     runtime.features      = plan.features;
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;

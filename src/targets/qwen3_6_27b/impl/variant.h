@@ -42,6 +42,9 @@ struct Variant {
     // graph_primary_attention_layers and the secondary the rest. Non-graph targets set these to
     // {false, 0}. See docs/DUAL-V100-PORT-PLAN.md.
     static constexpr bool supports_graph_parallel               = true;
+    // 27B keeps NVLink tensor-parallel attention and the dense (non-MoE) post_mixer graph path.
+    static constexpr bool graph_parallel_attention              = true;
+    static constexpr bool graph_parallel_post_mixer_is_moe      = false;
     static constexpr std::size_t graph_primary_attention_layers = 5;
 
     static void attention_projection(const Tensor& hidden,

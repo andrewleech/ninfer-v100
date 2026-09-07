@@ -166,6 +166,9 @@ void copy_row_split_shard_from_host(const Reader& reader,
         const std::uint64_t kv_total = tensor->shape[0] - shard.split;
         primary_shape   = {q_total / 2 + kv_total / 2, tensor->shape[1]};
         secondary_shape = {(q_total - q_total / 2) + (kv_total - kv_total / 2), tensor->shape[1]};
+    } else if (shard.axis == RowSplitShardAxis::RowBand) {
+        primary_shape   = {shard.split, tensor->shape[1]};
+        secondary_shape = {tensor->shape[0] - shard.split, tensor->shape[1]};
     } else {
         primary_shape   = {tensor->shape[0], shard.split};
         secondary_shape = {tensor->shape[0], tensor->shape[1] - shard.split};
@@ -216,6 +219,18 @@ void copy_row_split_shard_from_host(const Reader& reader,
                                    q_half, 0, sec_q, g, stream, copied_bytes);
         copy_row_split_region_host(secondary, secondary_geometry, sec_q, source, source_geometry,
                                    q_total + kv_half, 0, sec_kv, g, stream, copied_bytes);
+        return;
+    }
+    if (shard.axis == RowSplitShardAxis::RowBand) {
+        // Primary = source rows [0, split); secondary = source rows [split, rows). Full column width
+        // (groups == groups_per_row), so each plane copies as one contiguous [rows_shard x pitch]
+        // block. This is the expert-index MoE split (routed_gate_up @131072, routed_down @262144).
+        const std::uint64_t g = source_geometry.groups_per_row;
+        copy_row_split_region_host(primary, primary_geometry, 0, source, source_geometry, 0, 0,
+                                   shard.split, g, stream, copied_bytes);
+        copy_row_split_region_host(secondary, secondary_geometry, 0, source, source_geometry,
+                                   shard.split, 0, source_geometry.rows - shard.split, g, stream,
+                                   copied_bytes);
         return;
     }
 

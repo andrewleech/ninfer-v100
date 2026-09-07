@@ -74,8 +74,11 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    // Dual-device launch => expert-parallel MoE (experts split 128/128 across the two cards).
+    const bool graph_parallel = options.devices.size() == 2;
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
-        weights_profile, detail::bind_artifact(binder, qwen3_6::startup_features(options))));
+        weights_profile,
+        detail::bind_artifact(binder, qwen3_6::startup_features(options), graph_parallel)));
 }
 
 std::unique_ptr<Package::LoadedModel>

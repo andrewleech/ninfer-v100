@@ -262,6 +262,15 @@ private:
     template <class Payload, class V = Variant>
     void post_mixer_graph(const Tensor& hidden, const Payload& payload, Tensor& residual,
                           int tokens);
+    // Dual-device (NVLink) expert-parallel MoE: the routed experts are split 128/128 across the two
+    // cards. The primary computes its owned experts + the shared expert into primary_partial; the
+    // secondary peer-copies the normalized hidden, computes its owned experts into secondary_partial,
+    // and copies it back; the two partials are reduced into the residual on the primary stream. The
+    // additive reduce mirrors post_mixer_graph. Templated so payload.op / payload.secondary_op and
+    // ops::sparse_moe_partial are dependent names, instantiated only for the MoE variant.
+    template <class Payload, class V = Variant>
+    void run_sparse_moe_graph(const Tensor& hidden, const Payload& payload, Tensor& residual,
+                              int tokens);
     // NVLink tensor-parallel attention for one full-attention layer: each card computes its 12q/2kv
     // head half (projection shard + norms + RoPE + local GQA against its half of the KV heads), the
     // two [q_size/2,T] outputs are gathered on the primary, and the full o_proj runs there. Templated

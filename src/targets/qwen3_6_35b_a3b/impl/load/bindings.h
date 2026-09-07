@@ -109,10 +109,16 @@ struct ArtifactLoadPlan {
     artifact::MaterializationPlan materialization;
 };
 
-ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features);
+ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
+                               bool graph_parallel = false);
 
 struct SparseMoePayload {
-    ops::SparseMoeWeights op;
+    ops::SparseMoeWeights op;  // primary: routed shard = experts 0-127 (rank 0) on dual-card
+    // Expert-parallel MoE: experts 128-255 live on rank 1. routed_gate_up/routed_down point into the
+    // secondary weights arena; router_shared_gate/shared_* alias the primary (rank-0) copies, reached
+    // by the rank-1 kernels over UVA peer access. Populated only when graph_parallel; null otherwise.
+    ops::SparseMoeWeights secondary_op{};
+    bool has_secondary = false;
 };
 
 struct AttentionProjectionPayload {

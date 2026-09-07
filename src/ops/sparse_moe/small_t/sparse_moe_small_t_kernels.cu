@@ -169,20 +169,22 @@ void launch_s2(const float* partial_scores, int* token_ids, float* token_alpha, 
 
 void launch_s3_tiled(const Tensor& x, const SparseMoeWeights& weights,
                      const SparseMoeSmallTPlan& plan, const SparseMoeSmallTWorkspace& workspace,
-                     cudaStream_t stream) {
+                     cudaStream_t stream, SparseMoeShard shard) {
     sparse_moe_decode_launch_d3_small_t(
         x, weights, static_cast<const int*>(workspace.token_ids.data),
-        static_cast<float*>(workspace.scratch.data), plan.tokens, plan.d3_schedule, stream);
+        static_cast<float*>(workspace.scratch.data), plan.tokens, plan.d3_schedule, stream, nullptr,
+        shard);
 }
 
 void launch_s4_tiled(const SparseMoeWeights& weights, Tensor& destination,
                      const SparseMoeSmallTPlan& plan, const SparseMoeSmallTWorkspace& workspace,
-                     cudaStream_t stream) {
+                     cudaStream_t stream, SparseMoeShard shard) {
     sparse_moe_decode_launch_d4_small_t(
         weights, destination, static_cast<const int*>(workspace.token_ids.data),
         static_cast<const float*>(workspace.token_alpha.data),
         static_cast<const float*>(workspace.shared_scale.data),
-        static_cast<const float*>(workspace.scratch.data), plan.tokens, plan.d4_schedule, stream);
+        static_cast<const float*>(workspace.scratch.data), plan.tokens, plan.d4_schedule, stream,
+        nullptr, shard);
 }
 
 template <class Launch>
@@ -335,7 +337,8 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,
-                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
+                               SparseMoeShard shard) {
     dispatch_tokens(plan.tokens, [&]<int Tokens>() {
         launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),
                           static_cast<const __nv_bfloat16*>(weights.router_shared_gate.qdata),
@@ -345,8 +348,8 @@ void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                           static_cast<float*>(workspace.token_alpha.data),
                           static_cast<float*>(workspace.shared_scale.data), stream);
     });
-    launch_s3_tiled(x, weights, plan, workspace, stream);
-    launch_s4_tiled(weights, destination, plan, workspace, stream);
+    launch_s3_tiled(x, weights, plan, workspace, stream, shard);
+    launch_s4_tiled(weights, destination, plan, workspace, stream, shard);
 }
 
 } // namespace ninfer::ops::detail

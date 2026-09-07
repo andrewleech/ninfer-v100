@@ -29,6 +29,7 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/sparse_moe.h"
 
 #include <cuda_runtime.h>
 
@@ -825,10 +826,11 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
 
-    if constexpr (Variant::supports_graph_parallel) {
+    if constexpr (Variant::supports_graph_parallel && Variant::graph_parallel_attention) {
         // NVLink tensor-parallel attention: split this layer's heads across both cards. Only taken
         // when the secondary KV pool + sharded projection were installed (tp_attention); otherwise
-        // the single-card path below runs unchanged.
+        // the single-card path below runs unchanged. Compiled out for MoE-only graph targets (e.g.
+        // the 35B, whose attention stays single-card), so attn_mix_graph is never instantiated there.
         if (graph_parallel_active() && secondary_batch_text_kv_ != nullptr) {
             attn_mix_graph(w, *w.projection, x, fidx, ph);
             return;
@@ -1007,7 +1009,11 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 
     if constexpr (Variant::supports_graph_parallel) {
         if (graph_parallel_active()) {
-            post_mixer_graph(h, *m.payload, x, T);
+            if constexpr (Variant::graph_parallel_post_mixer_is_moe) {
+                run_sparse_moe_graph(h, *m.payload, x, T);
+            } else {
+                post_mixer_graph(h, *m.payload, x, T);
+            }
             return;
         }
     }
@@ -1057,6 +1063,66 @@ void TextContext::post_mixer_graph(const Tensor& hidden, const Payload& payload,
     // Back on the primary: wait for the secondary shard, pull its partial over NVLink, and reduce
     // both partials into the residual. All three enqueue on the primary stream, so end-of-step sync
     // of the primary stream alone gates the next layer.
+    CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
+    CUDA_CHECK(cudaMemcpyAsync(peer_partial.data, secondary_partial.data, peer_partial.bytes(),
+                               cudaMemcpyDefault, primary_stream));
+    ops::residual_add_two(primary_partial, peer_partial, residual, primary_stream);
+}
+
+template <class Payload, class V>
+void TextContext::run_sparse_moe_graph(const Tensor& hidden, const Payload& payload,
+                                       Tensor& residual, int tokens) {
+    const std::int32_t hidden_dim = kCfg.hidden;
+    cudaStream_t primary_stream   = ctx_.stream_for_rank(0);
+    cudaEvent_t primary_ready     = ctx_.fence_for_rank(0);
+    cudaEvent_t secondary_ready   = ctx_.fence_for_rank(1);
+
+    // Both partials and the peer landing buffer live in the primary arena (inside the caller's mlp
+    // scope). residual holds the post-attention residual and is updated in place by the final reduce.
+    Tensor primary_partial = work_.alloc(DType::BF16, {hidden_dim, tokens});
+    Tensor peer_partial    = work_.alloc(DType::BF16, {hidden_dim, tokens});
+
+    // Publish that the normalized hidden is ready, then run the primary shard (experts 0-127 + the
+    // shared expert) so it overlaps the secondary's copy + compute. Router + top-8 are recomputed
+    // locally over all 256 experts on each card (deterministic tie-break => identical selection), so
+    // no ids/alpha broadcast is needed. WritePartial epilogue seeds primary_partial from zero.
+    CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
+    const ops::SparseMoeShard primary_shard{
+        .expert_lo = 0, .expert_hi = 128, .include_shared = true, .add_residual = false};
+    {
+        auto primary_scope = work_.scope();
+        const std::size_t primary_bytes = ops::sparse_moe_partial_workspace_capacity_bytes(
+            payload.op.routed_gate_up.qtype, payload.op.routed_down.qtype, tokens, tokens);
+        WorkspaceArena primary_leaf(work_.alloc_bytes(primary_bytes));
+        ops::sparse_moe_partial(hidden, payload.op, primary_shard, primary_partial, primary_leaf,
+                                primary_stream);
+    }
+
+    // Keep the secondary arena scope open across the copy-back so secondary_partial's storage stays
+    // reserved until the reduce reads it (no reliance on a cross-layer fence chain).
+    auto secondary_scope = secondary_work_->scope();
+    Tensor secondary_partial;
+    {
+        ScopedDeviceRank secondary(ctx_, 1);
+        cudaStream_t secondary_stream = ctx_.stream_for_rank(1);
+        Tensor secondary_hidden       = secondary_work_->alloc(DType::BF16, {hidden_dim, tokens});
+        secondary_partial             = secondary_work_->alloc(DType::BF16, {hidden_dim, tokens});
+        CUDA_CHECK(cudaStreamWaitEvent(secondary_stream, primary_ready, 0));
+        CUDA_CHECK(cudaMemcpyAsync(secondary_hidden.data, hidden.data, hidden.bytes(),
+                                   cudaMemcpyDefault, secondary_stream));  // broadcast hidden
+        const ops::SparseMoeShard secondary_shard{
+            .expert_lo = 128, .expert_hi = 256, .include_shared = false, .add_residual = false};
+        const std::size_t secondary_bytes = ops::sparse_moe_partial_workspace_capacity_bytes(
+            payload.secondary_op.routed_gate_up.qtype, payload.secondary_op.routed_down.qtype,
+            tokens, tokens);
+        WorkspaceArena secondary_leaf(secondary_work_->alloc_bytes(secondary_bytes));
+        ops::sparse_moe_partial(secondary_hidden, payload.secondary_op, secondary_shard,
+                                secondary_partial, secondary_leaf, secondary_stream);
+        CUDA_CHECK(cudaEventRecord(secondary_ready, secondary_stream));
+    }
+    // Back on the primary: wait for the secondary shard, pull its partial over NVLink, and reduce
+    // residual + primary_partial + peer_partial. All enqueue on the primary stream, so an end-of-step
+    // sync of the primary stream alone gates the next layer.
     CUDA_CHECK(cudaStreamWaitEvent(primary_stream, secondary_ready, 0));
     CUDA_CHECK(cudaMemcpyAsync(peer_partial.data, secondary_partial.data, peer_partial.bytes(),
                                cudaMemcpyDefault, primary_stream));

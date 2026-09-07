@@ -20,6 +20,19 @@ struct SparseMoeWeights {
 
 enum class SparseMoeEpilogue : std::uint8_t {
     AddResidual,
+    // Expert-parallel partial: overwrite destination with this card's weighted partial sum (no
+    // residual read). Used by sparse_moe_partial; the residual is added once by the orchestrator.
+    WritePartial,
+};
+
+// Dual-card expert-parallel descriptor. A card owns global experts [expert_lo, expert_hi); the
+// router+top-8 selection is still computed globally over all 256 experts, but only the owned subset
+// is accumulated. The shared expert is computed once (primary only, include_shared=true).
+struct SparseMoeShard {
+    int expert_lo       = 0;    // first global expert this card owns
+    int expert_hi       = 256;  // one past the last owned global expert
+    bool include_shared = true; // compute the always-on shared expert here (PRIMARY ONLY)
+    bool add_residual   = true; // epilogue seeds from destination (single-card) vs 0 (EP partial)
 };
 
 /**
@@ -61,5 +74,30 @@ enum class SparseMoeEpilogue : std::uint8_t {
  */
 void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
                 Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Dual-card expert-parallel partial of sparse_moe. Runs the global router + top-8 selection over all
+ * 256 experts (from weights.router_shared_gate, replicated on both cards), then accumulates only the
+ * selected experts whose global id falls in [shard.expert_lo, shard.expert_hi). weights.routed_gate_up
+ * / routed_down are the COMPACTED shard for that expert band (local row 0 == expert_lo), so their row
+ * counts are (expert_hi-expert_lo)*1024 and *2048. When shard.include_shared the always-on shared
+ * expert is added (primary card only). destination is overwritten with this card's weighted partial
+ * (shard.add_residual must be false for EP); the residual is reduced in once by the orchestrator.
+ *
+ * Only the decode (T==1) and small-T (2<=T<=46) kernel paths run; larger T is chunked through the
+ * small-T kernels (the grouped prefill path is out of scope for expert-parallel in P1). Otherwise the
+ * geometry, codec profiles, and determinism guarantees match sparse_moe.
+ */
+void sparse_moe_partial(const Tensor& x, const SparseMoeWeights& weights, const SparseMoeShard& shard,
+                        Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Transient capacity required by sparse_moe_partial for every T in [min_tokens,max_tokens]. A safe
+ * upper bound (the partial path never exceeds the full sparse_moe workspace for the same interval).
+ */
+[[nodiscard]] std::size_t sparse_moe_partial_workspace_capacity_bytes(QType routed_gate_up,
+                                                                      QType routed_down,
+                                                                      std::int32_t min_tokens,
+                                                                      std::int32_t max_tokens);
 
 } // namespace ninfer::ops

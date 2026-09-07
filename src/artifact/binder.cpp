@@ -141,6 +141,12 @@ void Binder::shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAx
         if (split == 0 || split >= rows || (split % 2) != 0 || ((rows - split) % 2) != 0) {
             throw ArtifactError("qkv-head-half shard split is outside the logical row range");
         }
+    } else if (axis == RowSplitShardAxis::RowBand) {
+        // One contiguous outer-row band. The row-split-k128 grouping runs along the columns and is
+        // untouched by an outer-row split, so no column-group check applies.
+        if (split == 0 || split >= rows) {
+            throw ArtifactError("row-band shard split is outside the logical row range");
+        }
     } else {
         if (split == 0 || split >= cols) {
             throw ArtifactError("column shard split is outside the logical column range");
@@ -226,6 +232,9 @@ MaterializationPlan Binder::finish() {
                     const std::uint64_t kv_total = rows - shard->split;
                     primary_shape   = {q_total / 2 + kv_total / 2, cols};
                     secondary_shape = {(q_total - q_total / 2) + (kv_total - kv_total / 2), cols};
+                } else if (shard->axis == RowSplitShardAxis::RowBand) {
+                    primary_shape   = {shard->split, cols};
+                    secondary_shape = {rows - shard->split, cols};
                 } else {
                     primary_shape   = {rows, shard->split};
                     secondary_shape = {rows, cols - shard->split};

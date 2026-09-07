@@ -136,8 +136,7 @@ void require_quantized(const Weight& weight, std::int32_t n, std::int32_t k, con
     ranges.push_back(address_range(weight.scales, scale_bytes, std::string(name) + " scales"));
 }
 
-void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {
-    require_router(weights.router_shared_gate, ranges);
+void validate_routed_codecs(const SparseMoeWeights& weights) {
     if (weights.routed_gate_up.qtype != QType::Q4G64_F16S &&
         weights.routed_gate_up.qtype != QType::W8G32_F16S) {
         throw std::invalid_argument("sparse_moe: routed_gate_up must be Q4 or W8");
@@ -147,14 +146,39 @@ void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>
         weights.routed_down.qtype != QType::W8G32_F16S) {
         throw std::invalid_argument("sparse_moe: routed_down must be Q5, Q6, or W8");
     }
+}
+
+void require_shared(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {
     if (weights.shared_gate_up.qtype != QType::W8G32_F16S ||
         weights.shared_down.qtype != QType::W8G32_F16S) {
         throw std::invalid_argument("sparse_moe: shared weights must be W8");
     }
-    require_quantized(weights.routed_gate_up, kRoutedGateRows, kHidden, "routed_gate_up", ranges);
-    require_quantized(weights.routed_down, kRoutedDownRows, kIntermediate, "routed_down", ranges);
     require_quantized(weights.shared_gate_up, kSharedGateRows, kHidden, "shared_gate_up", ranges);
     require_quantized(weights.shared_down, kHidden, kIntermediate, "shared_down", ranges);
+}
+
+void validate_weights(const SparseMoeWeights& weights, std::vector<AddressRange>& ranges) {
+    require_router(weights.router_shared_gate, ranges);
+    validate_routed_codecs(weights);
+    require_quantized(weights.routed_gate_up, kRoutedGateRows, kHidden, "routed_gate_up", ranges);
+    require_quantized(weights.routed_down, kRoutedDownRows, kIntermediate, "routed_down", ranges);
+    require_shared(weights, ranges);
+}
+
+// Expert-parallel variant: the routed banks are the COMPACTED shard for experts [lo,hi), so the row
+// counts scale with the owned expert count. The router is full (both cards select globally); the
+// shared bank is validated only when this card computes it.
+void validate_weights_partial(const SparseMoeWeights& weights, const SparseMoeShard& shard,
+                              std::vector<AddressRange>& ranges) {
+    if (shard.expert_lo < 0 || shard.expert_hi <= shard.expert_lo || shard.expert_hi > kExperts) {
+        throw std::invalid_argument("sparse_moe_partial: invalid expert range");
+    }
+    const std::int32_t owned = shard.expert_hi - shard.expert_lo;
+    require_router(weights.router_shared_gate, ranges);
+    validate_routed_codecs(weights);
+    require_quantized(weights.routed_gate_up, owned * kExpertRows, kHidden, "routed_gate_up", ranges);
+    require_quantized(weights.routed_down, owned * kHidden, kIntermediate, "routed_down", ranges);
+    if (shard.include_shared) { require_shared(weights, ranges); }
 }
 
 #ifdef NINFER_VOLTA_BUILD
@@ -324,6 +348,105 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         const Tensor x_column     = x.slice(1, token, 1);
         Tensor destination_column = destination.slice(1, token, 1);
         detail::sparse_moe_decode_launch(x_column, weights, destination_column, views, stream);
+    }
+}
+
+std::size_t sparse_moe_partial_workspace_capacity_bytes(QType routed_gate_up, QType routed_down,
+                                                        std::int32_t min_tokens,
+                                                        std::int32_t max_tokens) {
+    // The partial path only uses the decode / small-T (and chunked small-T) kernels, never the
+    // grouped prefill kernel, so the full sparse_moe workspace is a safe upper bound.
+    return sparse_moe_workspace_capacity_bytes(routed_gate_up, routed_down, min_tokens, max_tokens);
+}
+
+void sparse_moe_partial(const Tensor& x, const SparseMoeWeights& weights, const SparseMoeShard& shard,
+                        Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = require_tensor(x, "x");
+    if (require_tensor(destination, "destination") != tokens) {
+        throw std::invalid_argument("sparse_moe_partial: x and destination token counts must match");
+    }
+    if (shard.add_residual) {
+        // The expert-parallel orchestrator seeds partials from zero and reduces the residual once,
+        // outside the kernels. A single-card add-residual caller should use sparse_moe() instead.
+        throw std::invalid_argument("sparse_moe_partial: expected a write-partial shard");
+    }
+
+    std::vector<AddressRange> ranges;
+    ranges.reserve(16);
+    ranges.push_back(address_range(x.data, x.bytes(), "x"));
+    ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
+    validate_weights_partial(weights, shard, ranges);
+
+    // Expert-parallel never uses the grouped prefill kernel; T>46 is chunked through small-T so every
+    // token remains exact (the grouped prefill EP path is out of scope for P1).
+    const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
+    const bool use_chunked = tokens > detail::kSparseMoeSmallTMax;
+    nvtx::ScopedRange moe_range(use_small_t ? nvtx::Name::SparseMoeSmallT
+                                            : nvtx::Name::SparseMoeDecode,
+                                nvtx::Category::Moe, static_cast<std::uint64_t>(tokens));
+    std::size_t required = 0;
+    if (use_chunked) {
+        required = detail::resolve_sparse_moe_small_t_plan(detail::kSparseMoeSmallTMax,
+                                                           weights.routed_gate_up.qtype,
+                                                           weights.routed_down.qtype)
+                       .workspace_bytes;
+    } else if (use_small_t) {
+        required = detail::resolve_sparse_moe_small_t_plan(tokens, weights.routed_gate_up.qtype,
+                                                           weights.routed_down.qtype)
+                       .workspace_bytes;
+    } else {
+        required = detail::resolve_sparse_moe_decode_plan(weights.routed_gate_up.qtype,
+                                                          weights.routed_down.qtype)
+                       .workspace_bytes;
+    }
+    if (workspace.base() == nullptr || workspace.capacity() < required ||
+        workspace.used() > workspace.capacity() - required) {
+        throw std::invalid_argument("sparse_moe_partial: insufficient workspace capacity");
+    }
+    ranges.push_back(address_range(workspace.base(), workspace.capacity(), "workspace"));
+    require_disjoint(ranges);
+
+    auto scope = workspace.scope();
+    if (use_chunked) {
+        for (std::int32_t begin = 0; begin < tokens; begin += detail::kSparseMoeSmallTMax) {
+            const std::int32_t count = std::min(detail::kSparseMoeSmallTMax, tokens - begin);
+            auto chunk_scope         = workspace.scope();
+            const Tensor x_chunk     = x.slice(1, begin, count);
+            Tensor destination_chunk = destination.slice(1, begin, count);
+            if (count >= detail::kSparseMoeSmallTMin) {
+                const detail::SparseMoeSmallTPlan plan = detail::resolve_sparse_moe_small_t_plan(
+                    count, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+                const detail::SparseMoeSmallTWorkspace views =
+                    detail::allocate_sparse_moe_small_t_workspace(workspace, count);
+                detail::sparse_moe_small_t_launch(x_chunk, weights, destination_chunk, plan, views,
+                                                  stream, shard);
+            } else {
+                const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
+                    weights.routed_gate_up.qtype, weights.routed_down.qtype);
+                const detail::SparseMoeDecodeWorkspace views =
+                    detail::allocate_sparse_moe_decode_workspace(workspace);
+                detail::sparse_moe_decode_launch(x_chunk, weights, destination_chunk, views, stream,
+                                                 shard);
+            }
+        }
+        return;
+    }
+    if (use_small_t) {
+        const detail::SparseMoeSmallTPlan plan = detail::resolve_sparse_moe_small_t_plan(
+            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+        const detail::SparseMoeSmallTWorkspace views =
+            detail::allocate_sparse_moe_small_t_workspace(workspace, tokens);
+        detail::sparse_moe_small_t_launch(x, weights, destination, plan, views, stream, shard);
+        return;
+    }
+    const detail::SparseMoeDecodePlan plan = detail::resolve_sparse_moe_decode_plan(
+        weights.routed_gate_up.qtype, weights.routed_down.qtype);
+    const detail::SparseMoeDecodeWorkspace views =
+        detail::allocate_sparse_moe_decode_workspace(workspace);
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        const Tensor x_column     = x.slice(1, token, 1);
+        Tensor destination_column = destination.slice(1, token, 1);
+        detail::sparse_moe_decode_launch(x_column, weights, destination_column, views, stream, shard);
     }
 }
 

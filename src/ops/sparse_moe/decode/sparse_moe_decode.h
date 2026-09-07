@@ -45,14 +45,17 @@ void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights
                                          const int* token_ids, float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD3Schedule schedule,
                                          cudaStream_t stream,
-                                         const int* adaptive_route_jobs = nullptr);
+                                         const int* adaptive_route_jobs = nullptr,
+                                         SparseMoeShard shard          = {});
 void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor& destination,
                                          const int* token_ids, const float* token_alpha,
                                          const float* shared_scale, const float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
                                          cudaStream_t stream,
-                                         const int* adaptive_route_jobs = nullptr);
+                                         const int* adaptive_route_jobs = nullptr,
+                                         SparseMoeShard shard          = {});
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
-                              const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream);
+                              const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream,
+                              SparseMoeShard shard = {});
 
 } // namespace ninfer::ops::detail
