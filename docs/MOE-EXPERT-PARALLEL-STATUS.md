@@ -93,11 +93,15 @@ passes on the 35B (main layer, grouped-prefill, MTP) shard the routed experts 12
   cross-check self-speculation must pass. 3-lens adversarial review clean.
 
 ## Next
-- **P3:** build the harness above, then a coordinated both-cards window vs llama.cpp. **Sweep depth
-  ALL THE WAY TO 262K** (user requirement, 2026-09-07) — not just ~180K. Measure **with MTP** (user
-  wants MTP included, not MTP-OFF-only). ninfer legs: MTP-on and MTP-off; llama legs where its draft
-  fits (its MTP OOMs near 262K, so note where it falls back). Scheduled with `titan-router` (stops
-  llama-swap for a guaranteed window — worked twice now).
+- **P3 — harness BUILT + dry-run-validated (2026-09-07)**, commit `9d68fff5`, in `bench/`:
+  `serve-ninfer-35b.sh` (dual-card EP serve), `bench_depth.py` (single-stream depth sweep — waits for
+  TRUE model-load, reads model-id from `/v1/models`, calibrates tokens/unit, streams TTFT+decode per
+  depth → CSV), `run-ninfer-legs.sh` (MTP-on + MTP-off legs). Validated against a mock OpenAI SSE
+  server (load-wait, calibration, stream parse, CSV). **Sweep to 262K** (ladder tops at 258048 under
+  the KV cap), **MTP measured** (ninfer MTP-on + MTP-off legs). llama is a NON-parity axis (serves
+  MTP-off at 262K). PENDING: a coordinated `titan-router` both-cards window (~25-30 min, max-new=32)
+  for the two ninfer legs; comparing against carbon's llama 35b matrix (or a llama leg with the same
+  `bench_depth.py` if the matrix lacks the full ladder).
 - **P4:** `serve-ninfer-35b-v100.sh` (dual-card, `--max-concurrency`) + model-router cutover.
 
 **GPU access:** always coordinate a BOTH-cards window with claude-net `titan-router` — llama-swap
