@@ -62,3 +62,5 @@ profiles/
 
 # Claude Code personal/local settings (may contain API tokens)
 .claude/settings.local.json
+
+build-moe.out
