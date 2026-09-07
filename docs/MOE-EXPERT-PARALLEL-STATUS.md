@@ -53,12 +53,39 @@ Harness notes for P3: ninfer serve exposes separated counters `RuntimeStats.comp
 Host has python3/jq/curl. **Get the model-id from `/v1/models`** (the guess `qwen3_6_35b_a3b` was
 wrong). **Wait for true model-load (~4.4 min), not just `/health`.**
 
+## P2 — grouped-prefill EP DONE + VALIDATED (2026-09-07)
+Commit `d099f2f4`. The expert-parallel partial now runs the **grouped-prefill** kernels for T>=47
+(Volta), so long prefill splits the routed experts 128/128 instead of P1's chunked `small_t`.
+
+- select_count re-tags owned assignments with the shard-LOCAL expert id (gather + grouped GEMM then
+  index the compacted `[expert_lo,expert_hi)` banks) and marks un-owned assignments `-1`; selection
+  stays global (deterministic => identical top-8, no broadcast). gather parks `-1`; reduce skips
+  `packed_index<0` so `routed_sum` is this card's partial. Shared expert + residual are the primary's
+  (`include_shared` gates the shared kernels; the shared-down merge honors `add_residual`, false for
+  the EP partials); the secondary writes `routed_sum` via a new `write_partial` kernel. The default
+  shard `{0,256,true,true}` is a strict no-op — single-card `sparse_moe()` prefill is unchanged.
+- **Arena root-cause fix:** the 35B `post_mixer_workspace_capacity_bytes` now models the two live
+  `[hidden,T]` EP partials + the sparse-MoE leaf (mirroring `run_sparse_moe_graph`'s alloc order).
+  This is why P1 had to cap the leaf to small-T; `sparse_moe_partial_workspace_capacity_bytes` now
+  returns the full prefill-inclusive size again.
+- **GPU-validated (`--devices 1,2`):** shard held (card1 11529 / card2 9159 MiB), **coherent on-task
+  generation** through the grouped-prefill EP path (163-tok prompt), **prefill 496 tok/s / decode
+  121 tok/s**, and — the P2 milestone — **zero bad_alloc** where P1 could not run the grouped path.
+  5-lens adversarial review (reduce-math, memory-safety, arena, single-card-noop, epilogue) clean.
+
+**MTP EP — assessed, NOT yet done (deferrable).** `Variant::mtp_post_mixer` calls single-card
+`run_sparse_moe` (full 256 W8/W8 experts on the primary), not `run_sparse_moe_graph`. MTP already
+loads + works this way (the MTP experts are in the 19.6 GB artifact, on card 1). MTP EP would shard
+the MTP MoE too (halve its compute + ~384 MB primary VRAM), but MTP is **single-stream only** (off
+under the concurrency EP targets, and off in the benchmark parity), so it is **off the throughput
+critical path**. Fold into a later pass if single-stream MTP-on decode becomes a goal.
+
 ## Next
-- **P2:** grouped-prefill EP (the critical lever for a 180K prefill — P1 falls back to chunked
-  `small_t`) + MTP EP (MTP MoE currently stays whole on card 0).
 - **P3:** build the harness above, then a coordinated back-to-back both-cards window vs llama.cpp
-  (depth×B grid, ~180K-centric, MTP-parity), scheduled with claude-net `titan-router`.
+  (depth×B grid, ~180K-centric, MTP-OFF parity), scheduled with claude-net `titan-router`. This is
+  what measures the grouped-prefill EP win the user asked for ("measured properly at different depths").
 - **P4:** `serve-ninfer-35b-v100.sh` (dual-card, `--max-concurrency`) + model-router cutover.
+- **Deferred:** MTP EP (above) — single-stream-only, not on the benchmark critical path.
 
 **GPU access:** always coordinate a BOTH-cards window with claude-net `titan-router` — llama-swap
 auto-spawns models on inbound requests, so a card can be reclaimed mid-window.
