@@ -92,8 +92,24 @@ passes on the 35B (main layer, grouped-prefill, MTP) shard the routed experts 12
   3.94 tok/round / 0 fallback. Greedy output **bit-identical to the no-MTP run** — the correctness
   cross-check self-speculation must pass. 3-lens adversarial review clean.
 
-## Next
-- **P3 — harness BUILT + dry-run-validated (2026-09-07)**, commit `9d68fff5`, in `bench/`:
+## P3 — MEASURED (2026-09-08). Result: prefill is the blocker; do NOT swap llama yet.
+Full 3-leg single-stream sweep to ~250K (fixed 64-tok output, TTFT split from decode-rate), commit
+`391b474d`; numbers + analysis in `bench/moe-ep-p3/FINDINGS.md`, raw CSVs in `results/`.
+
+- **llama.cpp PREFILL is 3–6× faster** than ninfer's grouped-prefill EP on this 35B MoE (llama
+  ~3000–4900 vs ninfer ~600–1140 tok/s), and ninfer degrades harder with depth → ninfer s/call is
+  much worse at long ctx (250K: ninfer 415 s vs llama 67.5 s). The going-in "ninfer prefill advantage"
+  premise is **false for the MoE** (it held for the dense 27B TP path; grouped-prefill EP is different).
+- ninfer **decode ≈ llama** MTP-off (1.0–1.14×); **MTP is the real win** (1.06–1.37× over its own
+  no-MTP; 43 vs 36 tok/s at 250K) + int8 KV + MTP-at-full-ctx llama can't do. Decode falloff ~3× both.
+- **Recommendation: keep llama.cpp 35b canonical.** EP makes the 35b *run* on ninfer (structurally
+  couldn't before — the real milestone) and decode/MTP/int8-KV are genuine, but prefill dominates real
+  summariser latency (long-in/short-out). **Prefill tuning is the critical next lever** — 600–1140 tok/s
+  is low + depth-sensitive ⇒ EP-reduce/permutation overhead, headroom exists. titan-router's pointer:
+  the dp4a/MMQ-style path that won the *27B* prefill-vs-llama fight may transfer to the MoE grouped path.
+
+## Harness notes (built + dry-run-validated 2026-09-07, hardened during the run)
+`bench/moe-ep-p3/` — self-contained serve-based A/B. commit `9d68fff5` +fixes `391b474d`:
   `serve-ninfer-35b.sh` (dual-card EP serve), `bench_depth.py` (single-stream depth sweep — waits for
   TRUE model-load, reads model-id from `/v1/models`, calibrates tokens/unit, streams TTFT+decode per
   depth → CSV), `run-ninfer-legs.sh` (MTP-on + MTP-off legs). Validated against a mock OpenAI SSE
