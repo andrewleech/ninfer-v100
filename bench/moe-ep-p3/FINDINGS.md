@@ -87,3 +87,69 @@ faster (226 s vs 68 s). The taper is the key diagnostic: the MoE GEMM is no long
 bottleneck — the **16 full-attention layers' O(N²) prefill + the per-chunk EP NVLink reduce** now
 dominate. That (not the MoE kernel) is the next prefill lever. The swap reopens only at shallow/mid
 context (gap 2.1× @8K, 2.9× @33K).
+
+---
+
+# Prefill phase split (2026-09-08): WHERE the deep-context time goes — MEASURED
+
+The "attention is next" diagnostic above was *inferred* from the dp4a taper. Now **measured**
+directly: `NINFER_DECODE_PROFILE=1` (syncs the primary stream around each mixer/mlp call, accumulates
+wall-clock into attn/gdn/mlp buckets) on the dp4a binary, dual-card EP, ctx 253952, `MAXNEW=1` so the
+buckets are ~pure prefill. Harness `profile-prefill.sh`. `attn` = attention (gather+flash+mask+
+converts); `gdn` = the linear/GDN-attention layers; `mlp` = MoE routed experts **+ EP NVLink reduce**.
+
+| depth | attn | gdn | mlp (MoE+EP) | total | attn s/1K | gdn s/1K | mlp s/1K |
+|------:|-----:|----:|-------------:|------:|:---------:|:--------:|:--------:|
+|  64K | 20.3s (43.7%) | 13.5s (29.1%) | 12.7s (27.3%) |  46.4s | 0.32 | 0.21 | 0.20 |
+| 128K | 63.8s (55.1%) | 26.8s (23.2%) | 25.3s (21.8%) | 115.9s | 0.50 | 0.21 | 0.20 |
+| 192K |142.8s (63.3%) | 42.2s (18.7%) | 40.6s (18.0%) | 225.6s | 0.74 | 0.22 | 0.21 |
+
+**Conclusive: attention is the deep-context lever.** It is 63% of prefill at 192K and the **only
+superlinear term** — its s/1K-token *rises* 0.32→0.50→0.74 (the O(N²) signature), while `gdn` and
+`mlp` are **flat at ~0.21 s/1K = clean O(N) linear** and never dominate. dp4a already took the linear
+MoE term; further MoE/EP work has diminishing returns at depth. **The EP NVLink reduce lives inside
+the small linear `mlp` bucket → overlapping it (the unused `transfer_stream_for_rank`) is a minor
+win, not the lever.** (Caveat: the profiler serializes the primary stream, so `mlp` loses EP overlap
+and is *pessimistic* — attention's real share is even higher than shown.)
+
+**The sharper puzzle for the next step:** attention already runs the *same* vendored llama.cpp
+flash+tensor-core kernel (`flash_attn_ext_f16`), yet ninfer's attention **alone** (143s @192K)
+exceeds llama's **whole** prefill (~68s @200K). So the gap is in **how the flash is driven** —
+FP32-Q staging, a dense per-Q-block causal mask, tiling/occupancy for D256 on sm_70, and the
+per-chunk serialized re-gather — **or llama uses a different V100 attention path for head_dim=256**.
+Pinning that (a flash-internal gather/mask/flash/convert sub-breakdown) is the next measurement;
+`profile-out/prefill-split.txt` has the raw buckets.
+
+---
+
+# Attention tiling experiments (2026-09-08): the tiling lever is EXHAUSTED
+
+Acting on the split above, the hypothesis was that ninfer under-tiles the flash Q-block: it hardcodes
+`ncols1 = 4` (kNcols = 32, the *minimum* Volta tile) for the 35B's 16q/2kv geometry, while llama.cpp's
+own `switch_ncols1` picks `ncols1 = 8` (kNcols = 64) for prefill — which would halve the query-tile
+count and thus the O(N²) KV re-streaming. Two builds, A/B'd against the `ncols1 = 4` baseline (attn
+bucket **20.3 / 63.8 / 142.8 s** @ 64/128/192K) with `validate-ncols.sh`:
+
+| variant | attn @64K | @128K | @192K | vs ncols1=4 |
+|--------|:--------:|:-----:|:-----:|:-----------:|
+| **ncols1=4 (baseline, committed)** | 20.3 | 63.8 | 142.8 | — |
+| ncols1=8 (64-col, Q in shared) | 22.8 | 72.2 | 154.1 | **~8-13% SLOWER** |
+| ncols1=8 + Q_in_reg=true | 32.9 | 114.6 | 245.3 | **~1.6-1.7× SLOWER** |
+
+Both bigger tiles LOSE, so **`ncols1 = 4` (32-col, 2 blocks/SM) is optimal and is kept.** The mechanism:
+- Plain 64-col: `shared_Q` scales with kNcols and busts Volta's 96 KB smem cap → occupancy drops
+  2 → 1 block/SM. It got *slower*, not faster — proof the kernel is **occupancy-bound, not
+  bandwidth-bound** (a BW-bound kernel would still gain from halving KV re-streaming at 1 block/SM).
+- 64-col + Q_in_reg=true (Q in registers to free the smem): far *worse* — D256 puts 128 half2/thread
+  of Q in registers → **register spill**, catastrophically register-bound.
+
+**Conclusion:** the attention *tiling* lever is exhausted; the vendored MMA kernel at its best Volta
+tiling can't reach llama's ~68 s whole-prefill, so llama's speed must come from a genuinely different
+D256-on-Volta path (different KV layout, the `fattn-tile` kernel, or lower precision), not a tile size
+this kernel can adopt. Remaining attention sub-levers are the per-chunk staging (re-gather, dense mask,
+fp32 converts) — unmeasured but estimated small (~1-2 s each) against ~143 s of flash compute, so
+low-yield. Correctness across both variants: coherent, ≥0.93 token-agreement (a tiling change reorders
+the online-softmax fp adds, so greedy divergence is expected and benign — byte-identity over-specifies
+here; reserve it for quant/no-op refactors like the dp4a int8-act path). Both changes reverted to
+committed `ncols1 = 4` / `Q_in_reg = false`. **Overall verdict is unchanged: keep llama.cpp 35B
+canonical.**

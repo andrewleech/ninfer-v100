@@ -64,6 +64,13 @@ struct VoltaFlashTiling<CausalD256H24Kv4> {
 template <>
 struct VoltaFlashTiling<CausalD256H16Kv2> {
     static constexpr int ncols2 = 8;
+    // ncols1 = 4 (kNcols = 32, the smallest Volta tile) is OPTIMAL for D256 on Volta and is kept
+    // deliberately -- it holds 2 blocks/SM. Both bigger tiles were MEASURED slower (bench/moe-ep-p3):
+    //   * ncols1 = 8 (64-col, Q in shared): ~8-13% slower -- shared_Q busts the 96 KB smem cap -> 1 block/SM.
+    //   * ncols1 = 8 + Q_in_reg=true:        ~1.6-1.7x slower -- 128 half2/thread of Q SPILLS registers.
+    // This D256 flash kernel is occupancy/register-bound, so more blocks/SM beats bigger tiles;
+    // the tiling lever is exhausted at 32-col. llama's faster D256-on-Volta prefill must come from a
+    // different KV layout / kernel, not a tile size this kernel can adopt.
     static constexpr int ncols1 = 4;
 };
 
