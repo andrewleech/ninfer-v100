@@ -71,6 +71,23 @@ struct Q5SimtDecodeAtom {
             weights[pair + 4]     = values.y * scale;
         }
     }
+
+    // dp4a variant: emit the eight symmetric int8 weights in [-16, 15] and the group scale
+    // separately. Mirrors decode_eight exactly (the ^0xff on the high plane folds the ^0x10
+    // sign-flip in): q[j] corresponds to weights[j].
+    __device__ static __forceinline__ void decode_eight_int8(std::uint32_t packed,
+                                                             std::uint8_t high_bits,
+                                                             std::uint16_t scale_bits,
+                                                             std::int8_t (&q)[8], float& scale) {
+        const std::uint32_t high = static_cast<std::uint32_t>(high_bits) ^ 0xffu;
+        scale                    = __half2float(__ushort_as_half(scale_bits));
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int n5 = static_cast<int>((packed >> (4 * j)) & 0x0fu) |
+                           (static_cast<int>((high >> j) & 1u) << 4);
+            q[j] = static_cast<std::int8_t>(n5 - 16);
+        }
+    }
 };
 
 struct Q5MmaDecodeAtom {

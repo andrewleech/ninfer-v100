@@ -31,6 +31,20 @@ struct Q4SimtDecodeAtom {
         }
     }
 
+    // dp4a variant: emit the eight symmetric int8 weights (nibble ^ 8) - 8 in [-8, 7] and the group
+    // scale separately, so an int8 __dp4a GEMM can accumulate in int32 and scale once at the end.
+    // The nibble ordering matches decode_eight above: q[j] corresponds to weights[j].
+    __device__ static __forceinline__ void
+    decode_eight_int8(std::uint32_t packed, std::uint16_t scale_bits, std::int8_t (&q)[8],
+                      float& scale) {
+        scale = __half2float(__ushort_as_half(scale_bits));
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int n = static_cast<int>((packed >> (4 * j)) & 0x0fu);
+            q[j]        = static_cast<std::int8_t>((n ^ 0x08) - 0x08);
+        }
+    }
+
     __device__ static __forceinline__ void
     decode_pair(std::uint8_t packed, std::uint16_t scale_bits, float& w0, float& w1) {
         const float scale = __half2float(__ushort_as_half(scale_bits));

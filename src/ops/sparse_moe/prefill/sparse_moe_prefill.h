@@ -58,11 +58,34 @@ struct SparseMoePrefillWorkspace {
     Tensor grouped_io;
     Tensor routed_storage;
     Tensor routed_sum;
+
+    // Volta int8/dp4a grouped-prefill scratch. grouped_i8 (the int8 gathered activation) aliases the
+    // grouped_io region — it is half the size and dead before the down kernel reuses that region for
+    // its bf16 output — so only the small scale planes and the int8 SwiGLU add arena growth, and only
+    // on the Volta build.
+    Tensor grouped_xs; // fp16 per-(slot, kHidden/64) activation scales for gate/up
+    Tensor swiglu_i8;  // int8 SwiGLU activation (down input)
+    Tensor swiglu_xs;  // fp16 per-(slot, kIntermediate/64) activation scales for down
 };
+
+// The int8/dp4a grouped path (Volta, Q4 gate/up + Q5/Q6 down) reserves extra scratch; nothing else
+// does. Gating the reservation on the codec keeps it off the tight W8/W8 (MTP) leaf and non-Volta.
+[[nodiscard]] inline bool sparse_moe_prefill_wants_dp4a_scratch(QType routed_gate_up,
+                                                                QType routed_down) noexcept {
+#ifdef NINFER_VOLTA_BUILD
+    return routed_gate_up == QType::Q4G64_F16S &&
+           (routed_down == QType::Q5G64_F16S || routed_down == QType::Q6G64_F16S);
+#else
+    (void)routed_gate_up;
+    (void)routed_down;
+    return false;
+#endif
+}
 
 template <class Arena>
 SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
-                                                                std::int32_t capacity_tokens) {
+                                                                std::int32_t capacity_tokens,
+                                                                bool dp4a_scratch = false) {
     SparseMoePrefillWorkspace out;
     const std::int32_t assignments = 8 * capacity_tokens;
     const std::int32_t route_tiles =
@@ -90,12 +113,22 @@ SparseMoePrefillWorkspace allocate_sparse_moe_prefill_workspace(Arena& arena,
 
     out.routed_storage = arena.alloc(DType::BF16, {512, assignments}, 256);
     out.routed_sum     = Tensor(out.routed_storage.data, DType::FP32, {2048, capacity_tokens});
+
+    // grouped_i8 aliases grouped_io (int8 view of the same region); only the scale planes and the
+    // int8 SwiGLU are fresh. Reserved only for the dp4a-eligible profile so the W8/W8 (MTP) leaf and
+    // non-Volta builds keep their exact footprint.
+    if (dp4a_scratch) {
+        out.grouped_xs = arena.alloc(DType::FP16, {assignments, 2048 / 64}, 256);
+        out.swiglu_i8  = arena.alloc(DType::I8, {assignments, 512}, 256);
+        out.swiglu_xs  = arena.alloc(DType::FP16, {assignments, 512 / 64}, 256);
+    }
     return out;
 }
 
 [[nodiscard]] bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
                                            QType routed_down) noexcept;
-[[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens);
+[[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens,
+                                                             bool dp4a_scratch = false);
 [[nodiscard]] SparseMoePrefillPlan
 resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down);
 

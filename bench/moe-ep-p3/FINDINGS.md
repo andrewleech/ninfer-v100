@@ -54,3 +54,36 @@ there is headroom. That's the P3 "throughput tune" lever, now clearly the critic
 - ~250K not full 262K (MTP OOMs at 262144 by ~70 MB; all legs capped at 253952 for a matched A/B).
 - Single-stream only. Concurrency (ninfer's batched EP vs llama single-stream) is a separate axis not
   measured here and could favor ninfer for multi-agent serving.
+
+---
+
+# dp4a follow-up (2026-09-08): int8/__dp4a grouped-prefill kernel
+
+The P3 recommendation ("prefill tuning is the lever") was acted on: the routed-expert grouped-prefill
+GEMMs (gate/up Q4 + down Q5/Q6, ~74% of MoE prefill) were ported from scalar-fp32-fmaf SIMT to
+int8/`__dp4a` — the same technique that took the 27B *dense* prefill compute-bound. Result
+`results/ninfer-dp4a.csv`, validated in a coordinated titan-router window.
+
+**Correctness:** dp4a vs `NINFER_MOE_PREFILL_SCALAR=1` (the retained scalar path) — byte-identical
+greedy output, 100% token agreement (int8-activation quant flipped no argmax). **Arena:** fits at
+**full 262144** non-MTP (633 MiB free-after-startup) — better than P3's 253952 cap.
+
+| depth | dp4a pf | scalar pf | llama pf | dp4a/scalar | llama/dp4a | dp4a s/call | llama s/call |
+|------:|--------:|----------:|---------:|:-----------:|:----------:|------------:|-------------:|
+|   8K  |  1871   |   1142    |  3998    |  **1.64×**  |   2.14×    |     4.9     |     2.7      |
+|  16K  |  1789   |   1082    |  4742    |    1.65×    |   2.65×    |     9.8     |     4.1      |
+|  33K  |  1718   |   1049    |  4906    |    1.64×    |   2.86×    |    19.9     |     7.5      |
+|  66K  |  1500   |    965    |  4172    |    1.55×    |   2.78×    |    45.0     |    16.7      |
+| 133K  |  1162   |    819    |  2949    |    1.42×    |   2.54×    |   115.6     |    46.3      |
+| 200K  |   889   |    681    |  3022    |    1.30×    |   3.40×    |   226.5     |    67.7      |
+| 250K  |   767   |    606    |  3805    |    1.27×    |   4.96×    |   328.0     |    67.5      |
+
+decode tok/s unchanged vs scalar (dp4a touches only prefill): 114/107/93/72/53/42/36.
+
+**Verdict:** a real, consistent **1.27–1.65× prefill win** that narrows the llama gap from 3–6× to
+~2.1–5× — but **does NOT overturn "keep llama canonical" for the deep-context summariser**. The win
+tapers with depth (1.64× @8K → 1.27× @250K), and at the real ~180–200K depth llama is still ~3.4×
+faster (226 s vs 68 s). The taper is the key diagnostic: the MoE GEMM is no longer the deep-depth
+bottleneck — the **16 full-attention layers' O(N²) prefill + the per-chunk EP NVLink reduce** now
+dominate. That (not the MoE kernel) is the next prefill lever. The swap reopens only at shallow/mid
+context (gap 2.1× @8K, 2.9× @33K).

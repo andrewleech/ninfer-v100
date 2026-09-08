@@ -27,13 +27,13 @@ bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
     return minimum != 0 && tokens >= minimum;
 }
 
-std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens) {
+std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens, bool dp4a_scratch) {
     if (max_tokens < kSparseMoePrefillWorkspaceMin) {
         throw std::invalid_argument("sparse_moe prefill: max_tokens must be at least 20");
     }
     const std::int32_t capacity_tokens = std::min(max_tokens, kSparseMoePrefillSliceMax);
     WorkspaceLayoutBuilder layout;
-    (void)allocate_sparse_moe_prefill_workspace(layout, capacity_tokens);
+    (void)allocate_sparse_moe_prefill_workspace(layout, capacity_tokens, dp4a_scratch);
     return layout.peak_bytes(1);
 }
 
@@ -48,7 +48,8 @@ SparseMoePrefillPlan resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType 
     }
 
     const std::int32_t slice_tokens = std::min(tokens, kSparseMoePrefillSliceMax);
-    return {tokens, slice_tokens, sparse_moe_prefill_workspace_bytes(tokens)};
+    const bool dp4a_scratch = sparse_moe_prefill_wants_dp4a_scratch(routed_gate_up, routed_down);
+    return {tokens, slice_tokens, sparse_moe_prefill_workspace_bytes(tokens, dp4a_scratch)};
 }
 
 } // namespace ninfer::ops::detail

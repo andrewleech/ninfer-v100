@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -1240,6 +1241,19 @@ struct SimtQ5Decode {
             scales + group_index * Storage::kScaleBytesPerGroup);
         Q5SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, w);
     }
+
+    __device__ static __forceinline__ void load_eight_int8(const std::uint8_t* codes,
+                                                          const std::uint8_t* high,
+                                                          const std::uint8_t* scales,
+                                                          std::int64_t group_index, int chunk,
+                                                          std::int8_t (&q)[8], float& scale) {
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            codes + group_index * Storage::kCodeBytesPerGroup + chunk * 4);
+        const std::uint8_t high_bits = high[group_index * Storage::kHighBytesPerGroup + chunk];
+        const auto scale_bits        = *reinterpret_cast<const std::uint16_t*>(
+            scales + group_index * Storage::kScaleBytesPerGroup);
+        Q5SimtDecodeAtom::decode_eight_int8(packed, high_bits, scale_bits, q, scale);
+    }
 };
 
 struct SimtQ6Decode {
@@ -1256,6 +1270,20 @@ struct SimtQ6Decode {
         const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
             scales + group_index * Storage::kScaleBytesPerGroup);
         Q6SimtDecodeAtom::decode_eight(packed, high_bits, scale_bits, w);
+    }
+
+    __device__ static __forceinline__ void load_eight_int8(const std::uint8_t* codes,
+                                                          const std::uint8_t* high,
+                                                          const std::uint8_t* scales,
+                                                          std::int64_t group_index, int chunk,
+                                                          std::int8_t (&q)[8], float& scale) {
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(
+            codes + group_index * Storage::kCodeBytesPerGroup + chunk * 4);
+        const std::uint16_t high_bits = *reinterpret_cast<const std::uint16_t*>(
+            high + group_index * Storage::kHighBytesPerGroup + chunk * 2);
+        const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+            scales + group_index * Storage::kScaleBytesPerGroup);
+        Q6SimtDecodeAtom::decode_eight_int8(packed, high_bits, scale_bits, q, scale);
     }
 };
 
@@ -1441,6 +1469,349 @@ __global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_router_simt_k
     }
 }
 
+// ---------------------------------------------------------------------------
+// Volta: int8/__dp4a grouped expert GEMMs (the MMQ-style path).
+//
+// The weight-stationary SIMT kernels above are already free of the per-token
+// weight re-read, but their inner product is scalar fp32 fmaf (1 MAC/instr).
+// These kernels swap that for __dp4a (4 int8 MACs/instr) — the same technique
+// that took the *dense* 27B prefill GEMM compute-bound (q4_volta_dp4a_gemm.cuh).
+// The routing / scan / gather / reduce scaffolding and the device-side job list
+// are reused verbatim; only the operand staging and the inner loop change, plus
+// two int8 quantise steps over the grouped buffers.
+//
+// The activation operand is quantised to symmetric int8 once (per (slot,64-group)
+// fp16 scale). Weights decode to symmetric int8 nibbles with the group scale kept
+// separate; the int32 dot is folded to fp32 per group as iacc * w_scale * x_scale
+// (each group carries its own scales, exactly like the dense kernel). Both operands
+// are zero-centred so the dp4a dot needs no zero-point correction. Warp-cooperative
+// mapping: lane selects the output row (its weight row is distinct per lane), warp
+// selects the column group, so the activation read is a warp broadcast.
+// ---------------------------------------------------------------------------
+
+constexpr int kDp4aWordsK  = kSimtTileK / 4; // 16 int32 words (of 4 int8) per 64-group
+constexpr int kDp4aWStride = kDp4aWordsK + 1; // 17: odd stride -> conflict-free per-lane weight rows
+
+__device__ __forceinline__ std::int32_t dp4a_pack(const std::int8_t (&q)[8], int lo) {
+    return (static_cast<std::int32_t>(q[lo]) & 0xff) |
+           ((static_cast<std::int32_t>(q[lo + 1]) & 0xff) << 8) |
+           ((static_cast<std::int32_t>(q[lo + 2]) & 0xff) << 16) |
+           ((static_cast<std::int32_t>(q[lo + 3]) & 0xff) << 24);
+}
+
+// Fused gather + int8 quantise: gather a token's kHidden row into its packed expert
+// column (as the SIMT gather does) but write symmetric int8 + a per-(slot,64-group)
+// fp16 scale instead of bf16. The int8 output aliases the grouped_io region (it is
+// half the size and dead before the down kernel reuses that region for its bf16
+// output), so this adds no arena growth over the bf16 grouped buffer.
+__global__ void sparse_moe_prefill_gather_quant_kernel(
+    const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
+    const int* __restrict__ local_rank, int* __restrict__ packed_index,
+    const int* __restrict__ tile_bases, std::int8_t* __restrict__ grouped_i8,
+    std::uint16_t* __restrict__ grouped_xs) {
+    const int assignment = static_cast<int>(blockIdx.x);
+    const int token      = assignment / kTopK;
+    const int expert     = ids[assignment];
+    if (expert < 0) {
+        if (threadIdx.x == 0) { packed_index[assignment] = -1; }
+        return;
+    }
+    const int tile   = token / kSparseMoeRouteTileTokens;
+    const int packed = tile_bases[static_cast<std::int64_t>(tile) * kExperts + expert] +
+                       local_rank[assignment];
+    const int t     = static_cast<int>(threadIdx.x); // 0..kExpertThreads-1
+    const int k     = t * 8;                          // 0..kHidden-8
+    const int group = k / kSimtTileK;                 // 0..kHidden/64-1  (== t/8)
+
+    const uint4 raw          = load_vec<uint4>(x + static_cast<std::int64_t>(token) * kHidden + k);
+    const __nv_bfloat16* vin = reinterpret_cast<const __nv_bfloat16*>(&raw);
+    float f[8];
+    float amax = 0.0f;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        f[e] = __bfloat162float(vin[e]);
+        amax = fmaxf(amax, fabsf(f[e]));
+    }
+    // amax over the eight lanes that share this 64-group (aligned group of 8 lanes).
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 4));
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float inv   = amax > 0.0f ? 127.0f / amax : 0.0f;
+    alignas(8) std::int8_t q8[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        q8[e] = static_cast<std::int8_t>(max(-127, min(127, __float2int_rn(f[e] * inv))));
+    }
+    *reinterpret_cast<int2*>(grouped_i8 + static_cast<std::int64_t>(packed) * kHidden + k) =
+        *reinterpret_cast<const int2*>(q8);
+    if ((t & 7) == 0) {
+        grouped_xs[static_cast<std::int64_t>(packed) * (kHidden / kSimtTileK) + group] =
+            __half_as_ushort(__float2half(scale));
+    }
+    if (t == 0) { packed_index[assignment] = packed; }
+}
+
+// Quantise the SwiGLU activation (down input) to symmetric int8 + per-(slot,64-group)
+// fp16 scale. One warp per (slot, group); slots past the live packed count hold
+// garbage but are never read by the down kernel (the ternary is NaN-safe: scale=1).
+__global__ void sparse_moe_prefill_quantize_swiglu_kernel(const __nv_bfloat16* __restrict__ act,
+                                                          std::int8_t* __restrict__ act_i8,
+                                                          std::uint16_t* __restrict__ act_xs,
+                                                          int slots) {
+    constexpr int kGroups = kIntermediate / kSimtTileK; // 8
+    const int warp = static_cast<int>(blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5));
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if (warp >= slots * kGroups) { return; }
+    const int slot          = warp / kGroups;
+    const int g             = warp % kGroups;
+    const std::int64_t base = static_cast<std::int64_t>(slot) * kIntermediate + g * kSimtTileK;
+    const float v0          = __bfloat162float(act[base + lane]);
+    const float v1          = __bfloat162float(act[base + lane + 32]);
+    float amax              = fmaxf(fabsf(v0), fabsf(v1));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) { amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o)); }
+    const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const float inv   = amax > 0.0f ? 127.0f / amax : 0.0f;
+    act_i8[base + lane]      = static_cast<std::int8_t>(max(-127, min(127, __float2int_rn(v0 * inv))));
+    act_i8[base + lane + 32] = static_cast<std::int8_t>(max(-127, min(127, __float2int_rn(v1 * inv))));
+    if (lane == 0) {
+        act_xs[static_cast<std::int64_t>(slot) * kGroups + g] =
+            __half_as_ushort(__float2half(scale));
+    }
+}
+
+// gate/up dp4a: W [expert_rows, kHidden] Q4 x int8 activation -> SwiGLU(slot,row).
+// Semantics identical to sparse_moe_prefill_q4_gate_up_simt_kernel (fused SwiGLU),
+// only the arithmetic is int8/dp4a. lane = output intermediate row (0..31), the 8
+// warps split this route job's BN columns.
+template <int BN>
+__global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_q4_gate_up_dp4a_kernel(
+    const std::int8_t* __restrict__ grouped_i8, const std::uint16_t* __restrict__ grouped_xs,
+    const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
+    const int* __restrict__ route_job_columns, const int* __restrict__ route_job_count,
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ activation) {
+    constexpr int kColsPerWarp  = BN / kSimtWarps;
+    constexpr int kGroupsPerRow = kHidden / kSimtTileK; // 32
+    constexpr int kExpertRows   = 2 * kIntermediate;
+    constexpr int kRowBlocks    = kIntermediate / kSimtRowsPerCta;
+    static_assert(BN % kSimtWarps == 0 && kIntermediate % kSimtRowsPerCta == 0);
+
+    __shared__ std::int32_t Wg[kSimtRowsPerCta][kDp4aWStride];
+    __shared__ std::int32_t Wu[kSimtRowsPerCta][kDp4aWStride];
+    __shared__ __align__(16) std::int32_t As[BN][kDp4aWordsK];
+    __shared__ float Wg_s[kSimtRowsPerCta];
+    __shared__ float Wu_s[kSimtRowsPerCta];
+    __shared__ float Xs[BN];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int total_work = *route_job_count * kRowBlocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work;
+         work += static_cast<int>(gridDim.x)) {
+        const int route_job   = work / kRowBlocks;
+        const int row_block   = work - route_job * kRowBlocks;
+        const int expert      = route_job_experts[route_job];
+        const int row0        = row_block * kSimtRowsPerCta;
+        const int begin       = expert_offsets[expert];
+        const int count       = expert_offsets[expert + 1] - begin;
+        const int column_base = route_job_columns[route_job];
+        const int cols        = min(count - column_base, BN);
+        if (cols <= 0) { continue; }
+
+        float acc_g[kColsPerWarp] = {};
+        float acc_u[kColsPerWarp] = {};
+
+        for (int group = 0; group < kGroupsPerRow; ++group) {
+            __syncthreads();
+            // int8 activations: BN columns x kDp4aWordsK words, zero-filled past `cols`.
+            for (int idx = tid; idx < BN * kDp4aWordsK; idx += kSimtThreads) {
+                const int c    = idx / kDp4aWordsK;
+                const int word = idx % kDp4aWordsK;
+                std::int32_t v = 0;
+                if (c < cols) {
+                    const std::int64_t slot = begin + column_base + c;
+                    v = *reinterpret_cast<const std::int32_t*>(
+                        grouped_i8 + slot * kHidden + group * kSimtTileK + word * 4);
+                }
+                As[c][word] = v;
+            }
+            for (int c = tid; c < BN; c += kSimtThreads) {
+                Xs[c] = (c < cols) ? __half2float(__ushort_as_half(
+                                         grouped_xs[static_cast<std::int64_t>(begin + column_base + c) *
+                                                        kGroupsPerRow +
+                                                    group]))
+                                   : 0.0f;
+            }
+            // weights: 32 rows x {gate,up} x 8 chunks, decoded to int8 once per tile.
+            for (int idx = tid; idx < kSimtRowsPerCta * 2 * (kSimtTileK / 8); idx += kSimtThreads) {
+                const int chunk     = idx % (kSimtTileK / 8);
+                const int gu        = (idx / (kSimtTileK / 8)) % 2;
+                const int row_local = idx / ((kSimtTileK / 8) * 2);
+                const std::int64_t row = static_cast<std::int64_t>(expert) * kExpertRows +
+                                         (gu != 0 ? kIntermediate : 0) + row0 + row_local;
+                const std::int64_t group_index = row * kGroupsPerRow + group;
+                const std::uint32_t packed     = *reinterpret_cast<const std::uint32_t*>(
+                    codes + group_index * Q4RowSplitStorage::kCodeBytesPerGroup + chunk * 4);
+                const auto scale_bits = *reinterpret_cast<const std::uint16_t*>(
+                    scales + group_index * Q4RowSplitStorage::kScaleBytesPerGroup);
+                std::int8_t q[8];
+                float s;
+                Q4SimtDecodeAtom::decode_eight_int8(packed, scale_bits, q, s);
+                std::int32_t* dst = gu != 0 ? &Wu[row_local][chunk * 2] : &Wg[row_local][chunk * 2];
+                dst[0]            = dp4a_pack(q, 0);
+                dst[1]            = dp4a_pack(q, 4);
+                if (chunk == 0) { (gu != 0 ? Wu_s : Wg_s)[row_local] = s; }
+            }
+            __syncthreads();
+
+            std::int32_t iacc_g[kColsPerWarp] = {};
+            std::int32_t iacc_u[kColsPerWarp] = {};
+#pragma unroll
+            for (int c = 0; c < kColsPerWarp; ++c) {
+                const int col = warp * kColsPerWarp + c;
+#pragma unroll
+                for (int w4 = 0; w4 < kDp4aWordsK; w4 += 4) {
+                    const uint4 xc = *reinterpret_cast<const uint4*>(&As[col][w4]);
+#pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        const std::int32_t xw = reinterpret_cast<const std::int32_t*>(&xc)[s];
+                        iacc_g[c] = __dp4a(Wg[lane][w4 + s], xw, iacc_g[c]);
+                        iacc_u[c] = __dp4a(Wu[lane][w4 + s], xw, iacc_u[c]);
+                    }
+                }
+            }
+            const float wgs = Wg_s[lane];
+            const float wus = Wu_s[lane];
+#pragma unroll
+            for (int c = 0; c < kColsPerWarp; ++c) {
+                const float xs = Xs[warp * kColsPerWarp + c];
+                acc_g[c] += static_cast<float>(iacc_g[c]) * wgs * xs;
+                acc_u[c] += static_cast<float>(iacc_u[c]) * wus * xs;
+            }
+        }
+
+        const int row = row0 + lane;
+#pragma unroll
+        for (int c = 0; c < kColsPerWarp; ++c) {
+            const int local_col = warp * kColsPerWarp + c;
+            if (local_col >= cols) { continue; }
+            const std::int64_t slot = begin + column_base + local_col;
+            activation[slot * kIntermediate + row] =
+                __float2bfloat16_rn(silu(acc_g[c]) * acc_u[c]);
+        }
+        __syncthreads();
+    }
+}
+
+// down dp4a: W [kHidden, kIntermediate] (Q5/Q6) x int8 SwiGLU -> output(slot,row).
+// The routing weight (alpha) is applied by the reduce kernel, matching the SIMT down.
+template <class Decode, int BN>
+__global__ __launch_bounds__(kSimtThreads) void sparse_moe_prefill_qx_down_dp4a_kernel(
+    const std::int8_t* __restrict__ act_i8, const std::uint16_t* __restrict__ act_xs,
+    const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
+    const int* __restrict__ route_job_columns, const int* __restrict__ route_job_count,
+    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ high,
+    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ output) {
+    constexpr int kColsPerWarp  = BN / kSimtWarps;
+    constexpr int kGroupsPerRow = kIntermediate / kSimtTileK; // 8
+    constexpr int kRowBlocks    = kHidden / kSimtRowsPerCta;
+    static_assert(BN % kSimtWarps == 0 && kHidden % kSimtRowsPerCta == 0);
+
+    __shared__ std::int32_t Ws[kSimtRowsPerCta][kDp4aWStride];
+    __shared__ __align__(16) std::int32_t As[BN][kDp4aWordsK];
+    __shared__ float Ws_s[kSimtRowsPerCta];
+    __shared__ float Xs[BN];
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    const int total_work = *route_job_count * kRowBlocks;
+    for (int work = static_cast<int>(blockIdx.x); work < total_work;
+         work += static_cast<int>(gridDim.x)) {
+        const int route_job   = work / kRowBlocks;
+        const int row_block   = work - route_job * kRowBlocks;
+        const int expert      = route_job_experts[route_job];
+        const int row0        = row_block * kSimtRowsPerCta;
+        const int begin       = expert_offsets[expert];
+        const int count       = expert_offsets[expert + 1] - begin;
+        const int column_base = route_job_columns[route_job];
+        const int cols        = min(count - column_base, BN);
+        if (cols <= 0) { continue; }
+
+        float acc[kColsPerWarp] = {};
+
+        for (int group = 0; group < kGroupsPerRow; ++group) {
+            __syncthreads();
+            for (int idx = tid; idx < BN * kDp4aWordsK; idx += kSimtThreads) {
+                const int c    = idx / kDp4aWordsK;
+                const int word = idx % kDp4aWordsK;
+                std::int32_t v = 0;
+                if (c < cols) {
+                    const std::int64_t slot = begin + column_base + c;
+                    v = *reinterpret_cast<const std::int32_t*>(
+                        act_i8 + slot * kIntermediate + group * kSimtTileK + word * 4);
+                }
+                As[c][word] = v;
+            }
+            for (int c = tid; c < BN; c += kSimtThreads) {
+                Xs[c] = (c < cols) ? __half2float(__ushort_as_half(
+                                         act_xs[static_cast<std::int64_t>(begin + column_base + c) *
+                                                    kGroupsPerRow +
+                                                group]))
+                                   : 0.0f;
+            }
+            for (int idx = tid; idx < kSimtRowsPerCta * (kSimtTileK / 8); idx += kSimtThreads) {
+                const int chunk        = idx % (kSimtTileK / 8);
+                const int row_local    = idx / (kSimtTileK / 8);
+                const std::int64_t row = static_cast<std::int64_t>(expert) * kHidden + row0 +
+                                         row_local;
+                const std::int64_t group_index = row * kGroupsPerRow + group;
+                std::int8_t q[8];
+                float s;
+                Decode::load_eight_int8(codes, high, scales, group_index, chunk, q, s);
+                Ws[row_local][chunk * 2]     = dp4a_pack(q, 0);
+                Ws[row_local][chunk * 2 + 1] = dp4a_pack(q, 4);
+                if (chunk == 0) { Ws_s[row_local] = s; }
+            }
+            __syncthreads();
+
+            std::int32_t iacc[kColsPerWarp] = {};
+#pragma unroll
+            for (int c = 0; c < kColsPerWarp; ++c) {
+                const int col = warp * kColsPerWarp + c;
+#pragma unroll
+                for (int w4 = 0; w4 < kDp4aWordsK; w4 += 4) {
+                    const uint4 xc = *reinterpret_cast<const uint4*>(&As[col][w4]);
+#pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        const std::int32_t xw = reinterpret_cast<const std::int32_t*>(&xc)[s];
+                        iacc[c]               = __dp4a(Ws[lane][w4 + s], xw, iacc[c]);
+                    }
+                }
+            }
+            const float ws = Ws_s[lane];
+#pragma unroll
+            for (int c = 0; c < kColsPerWarp; ++c) {
+                acc[c] += static_cast<float>(iacc[c]) * ws * Xs[warp * kColsPerWarp + c];
+            }
+        }
+
+        const int row = row0 + lane;
+#pragma unroll
+        for (int c = 0; c < kColsPerWarp; ++c) {
+            const int local_col = warp * kColsPerWarp + c;
+            if (local_col >= cols) { continue; }
+            const std::int64_t slot          = begin + column_base + local_col;
+            output[slot * kHidden + row] = __float2bfloat16_rn(acc[c]);
+        }
+        __syncthreads();
+    }
+}
 
 // W8 rowsplit: one int8 code per element with a row's codes contiguous
 // (kCodeBytesPerGroup == kGroupK), one FP16 scale per 32-element group.
@@ -1738,6 +2109,17 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
     auto* routed_activation = static_cast<__nv_bfloat16*>(workspace.routed_storage.data);
     auto* routed_sum        = static_cast<float*>(workspace.routed_sum.data);
 
+    // Volta int8/dp4a scratch. grouped_i8 is the int8 view of the grouped_io region (written by the
+    // quant-gather, dead before the down kernel reuses grouped_io for its bf16 output); the other
+    // three are the small fresh planes (null on non-Volta, never dereferenced there).
+    auto* grouped_i8 = reinterpret_cast<std::int8_t*>(workspace.grouped_io.data);
+    auto* grouped_xs = static_cast<std::uint16_t*>(workspace.grouped_xs.data);
+    auto* swiglu_i8  = static_cast<std::int8_t*>(workspace.swiglu_i8.data);
+    auto* swiglu_xs  = static_cast<std::uint16_t*>(workspace.swiglu_xs.data);
+
+    // Opt-out to the scalar-SIMT grouped path for A/B and regression (NINFER_MOE_PREFILL_SCALAR=1).
+    static const bool scalar_fallback = std::getenv("NINFER_MOE_PREFILL_SCALAR") != nullptr;
+
     for (std::int32_t token0 = 0; token0 < plan.tokens; token0 += plan.slice_tokens) {
         const std::int32_t tokens =
             std::min(plan.slice_tokens, static_cast<std::int32_t>(plan.tokens - token0));
@@ -1752,6 +2134,17 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                   : weights.routed_down.qtype == QType::Q6G64_F16S ? 52
                                                                                    : 0;
         const bool adaptive     = !sharded && tokens >= 47 && tokens <= adaptive_last;
+
+        // The dp4a grouped path runs the Q4 gate/up + Q5/Q6 down GEMMs in int8; adaptive (tiny-T
+        // decode route) and the W8 shared/MTP codecs stay on their existing kernels.
+#ifdef NINFER_VOLTA_BUILD
+        const bool use_dp4a = !scalar_fallback && !adaptive &&
+                              weights.routed_gate_up.qtype == QType::Q4G64_F16S &&
+                              (weights.routed_down.qtype == QType::Q5G64_F16S ||
+                               weights.routed_down.qtype == QType::Q6G64_F16S);
+#else
+        const bool use_dp4a = false;
+#endif // NINFER_VOLTA_BUILD
 
 #ifdef NINFER_VOLTA_BUILD
         {
@@ -1800,6 +2193,10 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                 SparseMoeSmallTD4Schedule::Rows4, stream, route_job_count);
             sparse_moe_prefill_gather_kernel<true><<<assignments, kExpertThreads, 0, stream>>>(
                 input, ids, local_rank, packed_index, tile_bases, grouped_io, route_job_count);
+        } else if (use_dp4a) {
+            // Fused gather + int8 quantise: writes grouped_i8 (aliasing grouped_io) + grouped_xs.
+            sparse_moe_prefill_gather_quant_kernel<<<assignments, kExpertThreads, 0, stream>>>(
+                input, ids, local_rank, packed_index, tile_bases, grouped_i8, grouped_xs);
         } else {
             sparse_moe_prefill_gather_kernel<false><<<assignments, kExpertThreads, 0, stream>>>(
                 input, ids, local_rank, packed_index, tile_bases, grouped_io, nullptr);
@@ -1808,10 +2205,23 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 
         const dim3 routed_gate_grid(kIntermediate / (kExpertBM / 2), kExperts);
 #ifdef NINFER_VOLTA_BUILD
-        // The grouped SIMT kernels take the same device-side job list and the same
-        // BN as the scan was told to use, so the column tiling matches exactly.
+        // The grouped kernels take the same device-side job list and the same BN as the scan was
+        // told to use, so the column tiling matches exactly. dp4a is the int8 path; the SIMT kernels
+        // are the scalar fallback (and the adaptive/W8 paths).
         if (weights.routed_gate_up.qtype == QType::Q4G64_F16S) {
-            if (wide_plan) {
+            if (use_dp4a) {
+                if (wide_plan) {
+                    sparse_moe_prefill_q4_gate_up_dp4a_kernel<64>
+                        <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                            grouped_i8, grouped_xs, offsets, route_job_experts, route_job_columns,
+                            route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
+                } else {
+                    sparse_moe_prefill_q4_gate_up_dp4a_kernel<32>
+                        <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                            grouped_i8, grouped_xs, offsets, route_job_experts, route_job_columns,
+                            route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
+                }
+            } else if (wide_plan) {
                 sparse_moe_prefill_q4_gate_up_simt_kernel<64>
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         grouped_io, offsets, route_job_experts, route_job_columns, route_job_count,
@@ -1889,9 +2299,31 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
 
         const dim3 routed_down_grid(kHidden / kExpertBM, kExperts);
 #ifdef NINFER_VOLTA_BUILD
+        // Quantise the SwiGLU activation to int8 for the dp4a down GEMM (one warp per (slot,64-group);
+        // a superset of the live packed slots — the tail is unread by the down job list).
+        if (use_dp4a) {
+            constexpr int kSwiWarpsPerBlock = kSimtThreads / 32;
+            const int swi_warps  = assignments * (kIntermediate / kSimtTileK);
+            const int swi_blocks = (swi_warps + kSwiWarpsPerBlock - 1) / kSwiWarpsPerBlock;
+            sparse_moe_prefill_quantize_swiglu_kernel<<<swi_blocks, kSimtThreads, 0, stream>>>(
+                routed_activation, swiglu_i8, swiglu_xs, assignments);
+            CUDA_CHECK(cudaGetLastError());
+        }
         switch (weights.routed_down.qtype) {
         case QType::Q5G64_F16S:
-            if (wide_plan) {
+            if (use_dp4a && wide_plan) {
+                sparse_moe_prefill_qx_down_dp4a_kernel<SimtQ5Decode, 64>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        swiglu_i8, swiglu_xs, offsets, route_job_experts, route_job_columns,
+                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
+                        grouped_io);
+            } else if (use_dp4a) {
+                sparse_moe_prefill_qx_down_dp4a_kernel<SimtQ5Decode, 32>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        swiglu_i8, swiglu_xs, offsets, route_job_experts, route_job_columns,
+                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
+                        grouped_io);
+            } else if (wide_plan) {
                 sparse_moe_prefill_qx_down_simt_kernel<SimtQ5Decode, 64>
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
@@ -1906,7 +2338,19 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             }
             break;
         case QType::Q6G64_F16S:
-            if (wide_plan) {
+            if (use_dp4a && wide_plan) {
+                sparse_moe_prefill_qx_down_dp4a_kernel<SimtQ6Decode, 64>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        swiglu_i8, swiglu_xs, offsets, route_job_experts, route_job_columns,
+                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
+                        grouped_io);
+            } else if (use_dp4a) {
+                sparse_moe_prefill_qx_down_dp4a_kernel<SimtQ6Decode, 32>
+                    <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
+                        swiglu_i8, swiglu_xs, offsets, route_job_experts, route_job_columns,
+                        route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
+                        grouped_io);
+            } else if (wide_plan) {
                 sparse_moe_prefill_qx_down_simt_kernel<SimtQ6Decode, 64>
                     <<<kPrefillPersistentBlocks, kSimtThreads, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
