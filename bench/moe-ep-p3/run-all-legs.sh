@@ -6,15 +6,20 @@
 #   DEPTHS=...  MAXNEW=32  OUTDIR=./results  [SKIP_LLAMA=1]  ./run-all-legs.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-DEPTHS="${DEPTHS:-8192,16384,32768,65536,131072,196608,258048}"
+# Deepest target 245760 lands ~250K actual (calibration overshoots ~1.7%), which fits the 253952 KV
+# cap with headroom for output+template. 253952 (~248K) is chosen because ninfer-serve --spec mtp
+# OOMs at the full 262144 by ~70MB (the MTP draft state + MTP-EP partials); 253952 clears it and is
+# still >=250K, and serving every leg at the same cap keeps the A/B uniform (per-depth rates don't
+# depend on the cap, only on actual prompt depth).
+DEPTHS="${DEPTHS:-8192,16384,32768,65536,131072,196608,245760}"
 MAXNEW="${MAXNEW:-64}"   # fixed decode count; the harness splits TTFT(prefill) from decode-rate, so
                          # output-length variance never contaminates the prefill-depth curve. 64 gives
                          # a stable decode-rate sample (16 MTP draft rounds) without bloating deep legs.
-CTX="${CTX:-262144}"
+CTX="${CTX:-253952}"
 OUTDIR="${OUTDIR:-$HERE/results}"
 LOADTO="${LOADTO:-900}"
 LLAMA_PORT="${LLAMA_PORT:-8001}"
-NINFER_PORT="${NINFER_PORT:-8080}"
+NINFER_PORT="${NINFER_PORT:-8090}"  # NOT 8080 (llama-swap's front door) — avoid a shared-port mixup
 mkdir -p "$OUTDIR"
 
 # Wait until both V100s (nvidia-smi idx 1,2) are back under 500 MiB — cards genuinely freed.
@@ -30,24 +35,23 @@ wait_cards_free() {
   echo "  WARN: cards still busy after 300s"; return 1
 }
 
-sweep() { # base label
+sweep() { # base label [require_model]
   python3 "$HERE/bench_depth.py" --base "$1" --out "$OUTDIR/$2.csv" \
-    --depths "$DEPTHS" --max-new "$MAXNEW" --label "$2" --load-timeout "$LOADTO"
+    --depths "$DEPTHS" --max-new "$MAXNEW" --label "$2" --load-timeout "$LOADTO" \
+    ${3:+--require-model "$3"}
 }
 
-# ---- Leg 1: llama.cpp (native, matched router config) --------------------------------------------
-if [ "${SKIP_LLAMA:-0}" != "1" ]; then
+llama_leg() { # llama.cpp native, matched router config
   echo "=== leg: llama-nomtp (port $LLAMA_PORT) ==="
   PORT="$LLAMA_PORT" CTX="$CTX" "$HERE/serve-llama-35b.sh" >"$OUTDIR/llama-serve.log" 2>&1 &
-  LLAMA_PID=$!
+  local pid=$!
   sweep "http://127.0.0.1:$LLAMA_PORT" llama-nomtp || echo "llama leg FAILED (see $OUTDIR/llama-serve.log)"
-  echo "  stopping llama-server (pid $LLAMA_PID)"
-  kill "$LLAMA_PID" 2>/dev/null || true
+  echo "  stopping llama-server (pid $pid)"
+  kill "$pid" 2>/dev/null || true
   pkill -f "llama-server .*Qwen3.6-35B" 2>/dev/null || true
   wait_cards_free
-fi
+}
 
-# ---- Legs 2 & 3: ninfer (docker) MTP-off then MTP-on ---------------------------------------------
 ninfer_leg() { # spec label
   local spec="$1" label="$2" cname="ninfer35b-bench-$1"
   echo "=== leg: $label (spec=$spec, port $NINFER_PORT) ==="
@@ -60,9 +64,9 @@ ninfer_leg() { # spec label
     ./apps/ninfer-serve /models/Qwen3.6-35B-A3B-NInfer/qwen3_6_35b_a3b.ninfer \
       --devices 1,2 --kv-dtype int8 --max-context "$CTX" --kv-capacity "$CTX" \
       --max-concurrency 1 --prefill-chunk 2048 --log-stats-interval-ms 2000 \
-      --model-id ninfer-35b --max-request-mib 128 --host 0.0.0.0 --port "$NINFER_PORT" \
+      --model-id ninfer-35b --max-request-mib 128 --no-thinking --host 0.0.0.0 --port "$NINFER_PORT" \
       $( [ "$spec" = mtp ] && echo "--spec mtp --draft-tokens 4" ) >/dev/null
-  sweep "http://127.0.0.1:$NINFER_PORT" "$label" || {
+  sweep "http://127.0.0.1:$NINFER_PORT" "$label" ninfer-35b || {
     echo "$label FAILED; serve logs:"; docker logs --tail 40 "$cname" 2>&1 || true; }
   echo "--- $label MTP/accept stats ---"
   docker logs "$cname" 2>&1 | grep -iE "accept|mtp|throughput|decode|prefill" | tail -12 || true
@@ -70,8 +74,12 @@ ninfer_leg() { # spec label
   wait_cards_free
 }
 
+# ninfer legs FIRST (the EP deliverable), so a slow deep llama leg can't starve them if the window
+# runs tight; llama last. Depths sweep shallow->deep and each row is flushed, so a timeout only drops
+# the deepest tail, never the whole leg.
 ninfer_leg none ninfer-nomtp
 ninfer_leg mtp  ninfer-mtp
+[ "${SKIP_LLAMA:-0}" != "1" ] && llama_leg
 
 echo "=== all legs done; results in $OUTDIR ==="
 ls -la "$OUTDIR"/*.csv 2>/dev/null

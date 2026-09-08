@@ -103,7 +103,9 @@ def stream_call(base, model_id, prompt, max_new):
         choices = chunk.get("choices") or []
         if choices:
             delta = choices[0].get("delta") or {}
-            if delta.get("content"):
+            # count content OR reasoning_content (thinking) so TTFT is the first generated token
+            # regardless of thinking mode; benchmarks run --no-thinking, this is belt-and-suspenders.
+            if delta.get("content") or delta.get("reasoning_content"):
                 if ttft is None:
                     ttft = time.time() - t0
                 decode_tokens += 1
@@ -120,12 +122,18 @@ def main():
     ap.add_argument("--model-id", default=None)
     ap.add_argument("--load-timeout", type=int, default=600)
     ap.add_argument("--warmup", action="store_true", help="one throwaway call before timing")
+    ap.add_argument("--require-model", default=None,
+                    help="abort if the served model id isn't this (guards against hitting a "
+                         "llama-swap-spawned model on a shared port)")
     args = ap.parse_args()
 
     depths = [int(x) for x in args.depths.split(",") if x.strip()]
     print(f"[{args.label}] waiting for model load at {args.base} (<= {args.load_timeout}s)...", flush=True)
     model_id, load_s = wait_for_load(args.base, args.model_id, args.load_timeout)
     print(f"[{args.label}] model '{model_id}' ready after {load_s:.0f}s", flush=True)
+    if args.require_model and model_id != args.require_model:
+        raise SystemExit(f"[{args.label}] WRONG MODEL: got '{model_id}', expected "
+                         f"'{args.require_model}' — is llama-swap answering this port?")
 
     tpu = calibrate_tokens_per_unit(args.base, model_id)
     print(f"[{args.label}] calibration: {tpu:.2f} tokens/unit", flush=True)
@@ -137,15 +145,27 @@ def main():
                     "decode_tokens", "decode_s", "decode_tok_s", "total_s"])
         for d in depths:
             prompt = build_prompt(d, tpu)
-            if args.warmup:
-                stream_call(args.base, model_id, prompt, 4)
-            ttft, total, dtoks, usage = stream_call(args.base, model_id, prompt, args.max_new)
+            try:
+                if args.warmup:
+                    stream_call(args.base, model_id, prompt, 4)
+                ttft, total, dtoks, usage = stream_call(args.base, model_id, prompt, args.max_new)
+            except Exception as e:
+                # one bad depth (server reject, context overflow, transient) must not kill the leg
+                print(f"[{args.label}] depth~{d}: ERROR {type(e).__name__}: {e}", flush=True)
+                w.writerow([args.label, d, -1, 0, 0.0, 0, 0.0, 0.0, 0.0]); f.flush()
+                continue
             pt = (usage or {}).get("prompt_tokens", 0)
             ct = (usage or {}).get("completion_tokens", dtoks)
-            decode_s = max(1e-6, total - (ttft or 0.0))
+            if not pt or ttft is None:
+                # empty/failed response (e.g. wrong model, context overflow): record and move on
+                print(f"[{args.label}] depth~{d}: no usable response (prompt={pt}, ttft={ttft})",
+                      flush=True)
+                w.writerow([args.label, d, pt or -1, 0, 0.0, ct, 0.0, 0.0, round(total, 3)])
+                f.flush(); continue
+            decode_s = max(1e-6, total - ttft)
             prefill_tok_s = pt / ttft if ttft else 0.0
             decode_tok_s = ct / decode_s if ct else 0.0
-            row = [args.label, d, pt, round(ttft or 0, 3), round(prefill_tok_s, 1),
+            row = [args.label, d, pt, round(ttft, 3), round(prefill_tok_s, 1),
                    ct, round(decode_s, 3), round(decode_tok_s, 2), round(total, 3)]
             w.writerow(row); f.flush()
             rows.append(row)
