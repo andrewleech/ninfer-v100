@@ -191,12 +191,25 @@ end-to-end time. Retain TP attention for the 35B dual-V100 production configurat
 `bench/moe-ep-p3/compare-out/tp-200k-mtp-r1-20260910` and
 `bench/moe-ep-p3/compare-out/base-200k-mtp-r1-20260910`.
 
-### llama.cpp at its maximum MTP-fitting context
+### Historical llama.cpp MTP depth ladder — not an end-to-end comparison
 
-The matched 35B llama.cpp MTP configuration fit only to `CTX=208896`; its deepest measured request
-was 196608 tokens. At that depth it recorded 579.6 prefill tok/s and 68.6 decode tok/s. The TP
-ninfer run, allocated for the larger 255K context and measured at 199982 tokens, records 1441.6
-prefill tok/s and 82.2 decode tok/s: 2.49x prefill and 1.20x decode. Normalizing both to a
-196608-token prompt plus a 2000-token completion gives 160.7 s for ninfer and 368.4 s for llama,
-or 2.29x faster end-to-end. The llama raw sweep is
-`bench/moe-ep-p3/compare-out/ctx208896-c2048-thorough/llama.csv`.
+The historical 35B llama.cpp depth ladder fit MTP only at `CTX=208896`, using q8_0 KV and
+three MTP drafts. Its final row reports 579.6 prefill tok/s and 68.6 decode tok/s. It must not
+be compared directly with the TP NInfer cold-prompt result or used to derive an end-to-end ratio:
+
+* The ladder reused llama-server's LCP/KV prefix between increasing prompts. At its nominal
+  196608-token depth, the server had a 200109-token resident sequence but evaluated only 69104 new
+  tokens in 119.23 s (`llama-server.log`); the old table treated that incremental rate as though it
+  described a cold 196608-token prefill.
+* This MTP configuration also logged `compute buffer allocation failed, retrying without pipeline
+  parallelism`. The current production llama route is intentionally MTP-off at 262144 context, so it
+  can retain its normal execution plan.
+* A 2026-09-10 paired control kept the historical GGUF, q8_0 KV, 208896 context, batch sizes,
+  layer split, template, and approximately 196K prompt, changing only `SPEC=off`. It measured
+  1613.3 prefill tok/s and 44.2 decode tok/s. This explains why the production route's real
+  compaction request recorded roughly 1584 prefill tok/s and 41.0 decode tok/s.
+
+The 579.6/68.6 values remain useful as an MTP-on, cache-warm-at-depth observation. They are not a
+production endpoint baseline, and the former 2.49x prefill, 1.20x decode, and 2.29x end-to-end
+claims are withdrawn. A valid cross-engine result needs fresh servers, cache-neutral prompts, the
+same MTP setting, and server-side per-request accounting.
