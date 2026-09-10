@@ -157,7 +157,15 @@ void kv_cache_append_launch(const Tensor& k, const Tensor& v, const Tensor& posi
         launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
         return;
     }
-    launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+    if (k.ne[1] == KVCacheAppendD256Kv2::KVHeads) {
+        launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+        return;
+    }
+    if (k.ne[1] == KVCacheAppendD256Kv1::KVHeads) {
+        launch_full<KVCacheAppendD256Kv1>(k, v, positions, cache, metadata, stream);
+        return;
+    }
+    throw std::invalid_argument("kv_cache_append: unsupported KV head geometry");
 }
 
 void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor& positions,
@@ -175,7 +183,15 @@ void kv_cache_append_batch_launch(const Tensor& k, const Tensor& v, const Tensor
             launch_full<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
             return;
         }
-        launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+        if (k.ne[1] == KVCacheAppendD256Kv2::KVHeads) {
+            launch_full<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
+            return;
+        }
+        if (k.ne[1] == KVCacheAppendD256Kv1::KVHeads) {
+            launch_full<KVCacheAppendD256Kv1>(k, v, positions, cache, metadata, stream);
+            return;
+        }
+        throw std::invalid_argument("kv_cache_append_batch: unsupported KV head geometry");
     };
     if (valid_columns.data == nullptr) {
         launch.template operator()<false>();

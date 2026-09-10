@@ -2,6 +2,8 @@
 // positions then launch causal attention over absolute cached history.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
+#include <stdexcept>
+
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_bf16.cuh"
@@ -105,8 +107,17 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
                                                                        metadata, out, stream);
         return;
     }
-    causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(q, positions, scale, cache,
-                                                                   metadata, out, stream);
+    if (q.ne[1] == CausalD256H8Kv1::QHeads) {
+        causal_attention_prompt_attention_launch_for<CausalD256H8Kv1>(q, positions, scale, cache,
+                                                                      metadata, out, stream);
+        return;
+    }
+    if (q.ne[1] == CausalD256H12Kv2::QHeads) {
+        causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(q, positions, scale, cache,
+                                                                       metadata, out, stream);
+        return;
+    }
+    throw std::invalid_argument("causal attention prompt: unsupported head geometry");
 }
 
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
@@ -141,8 +152,17 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
                 q_row, positions_row, scale, cache, metadata, out_row, stream);
             return;
         }
-        causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(
-            q_row, positions_row, scale, cache, metadata, out_row, stream);
+        if (q_row.ne[1] == CausalD256H8Kv1::QHeads) {
+            causal_attention_prompt_attention_launch_for<CausalD256H8Kv1>(
+                q_row, positions_row, scale, cache, metadata, out_row, stream);
+            return;
+        }
+        if (q_row.ne[1] == CausalD256H12Kv2::QHeads) {
+            causal_attention_prompt_attention_launch_for<CausalD256H12Kv2>(
+                q_row, positions_row, scale, cache, metadata, out_row, stream);
+            return;
+        }
+        throw std::invalid_argument("causal attention prompt: unsupported head geometry");
     };
     for (std::int32_t batch = 0; batch < q.ne[3]; ++batch) {
         Tensor q_row         = q.slice(3, batch, 1);

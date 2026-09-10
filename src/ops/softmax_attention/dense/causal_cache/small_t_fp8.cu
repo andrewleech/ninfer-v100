@@ -1,6 +1,8 @@
 // ninfer::ops::detail - FP8 E4M3FN split-KV small-T launch ownership.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
+#include <stdexcept>
+
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_fp8.cuh"
@@ -197,6 +199,9 @@ void causal_attention_small_t_fp8_launch(
             partial_l, out, stream);
         return;
     }
+    if (q.ne[1] == CausalD256H8Kv1::QHeads) {
+        throw std::invalid_argument("FP8 causal small-T attention does not support 8q/1kv");
+    }
     causal_attention_small_t_fp8_launch_for<CausalD256H16Kv2>(q, input, positions, scale, cache,
                                                               invocation, envelope, partial_acc,
                                                               partial_m, partial_l, out, stream);
@@ -223,6 +228,9 @@ void causal_attention_cached_small_t_fp8_launch(const Tensor& q, const Tensor& p
             q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,
             partial_l, out, stream);
         return;
+    }
+    if (q.ne[1] == CausalD256H8Kv1::QHeads) {
+        throw std::invalid_argument("FP8 cached small-T attention does not support 8q/1kv");
     }
     causal_attention_small_t_fp8_launch_for<CausalD256H16Kv2>(
         q, input, positions, scale, batch_cache, invocation, envelope, partial_acc, partial_m,

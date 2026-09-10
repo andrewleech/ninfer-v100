@@ -89,6 +89,10 @@ struct DFlashPlan {
 struct BindingPlan {
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
+    // Rank 0 owns the leading contiguous expert band when the 35B is on two cards.
+    // It is retained in the plan because materialized row-band weights are compacted.
+    std::int32_t primary_expert_count = 256;
+    bool tp_attention = false;
     artifact::ObjectHandle token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
     artifact::ObjectHandle final_norm;
@@ -110,7 +114,7 @@ struct ArtifactLoadPlan {
 };
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
-                               bool graph_parallel = false);
+                               bool graph_parallel = false, bool tp_attention = false);
 
 struct SparseMoePayload {
     ops::SparseMoeWeights op;  // primary: routed shard = experts 0-127 (rank 0) on dual-card
@@ -123,6 +127,8 @@ struct SparseMoePayload {
 
 struct AttentionProjectionPayload {
     Weight query_key_gate_value;
+    Weight secondary_query_key_gate_value;
+    bool head_sharded = false;
 };
 
 struct GdnProjectionPayload {

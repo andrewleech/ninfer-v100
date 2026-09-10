@@ -848,12 +848,38 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         throw std::logic_error("Text GQA execution envelope is not set");
     }
 
+    // Env-gated attention sub-phase timing (NINFER_ATTN_PROFILE): syncs s around the QKV/O
+    // projection GEMMs vs the flash-attention call, to split run_layers' single d_attn bucket
+    // into qkv_proj / fa / o_proj -- decides whether ninfer's attention deficit is the FA kernel
+    // or the projection GEMMs. Diagnostic, off by default; printed once at process exit.
+    static const bool aprof = std::getenv("NINFER_ATTN_PROFILE") != nullptr;
+    static std::atomic<double> a_qkv{0}, a_fa{0}, a_oproj{0};
+    struct ADump {
+        ~ADump() {
+            if (a_qkv.load() + a_fa.load() + a_oproj.load() > 0.0) {
+                std::fprintf(stderr, "[attn-prof] qkv_proj=%.3f fa=%.3f o_proj=%.3f (s)\n",
+                             a_qkv.load(), a_fa.load(), a_oproj.load());
+            }
+        }
+    };
+    static ADump adump;
+    const auto aphase = [&](std::atomic<double>& acc, auto&& fn) {
+        if (!aprof) { fn(); return; }
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        const auto t0 = std::chrono::steady_clock::now();
+        fn();
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        acc.store(acc.load() +
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    };
+
     if constexpr (Variant::supports_graph_parallel && Variant::graph_parallel_attention) {
         // NVLink tensor-parallel attention: split this layer's heads across both cards. Only taken
         // when the secondary KV pool + sharded projection were installed (tp_attention); otherwise
         // the single-card path below runs unchanged. Compiled out for MoE-only graph targets (e.g.
         // the 35B, whose attention stays single-card), so attn_mix_graph is never instantiated there.
-        if (graph_parallel_active() && secondary_batch_text_kv_ != nullptr) {
+        if (graph_parallel_active() && secondary_batch_text_kv_ != nullptr &&
+            Variant::attention_graph_enabled(*w.projection)) {
             attn_mix_graph(w, *w.projection, x, fidx, ph);
             return;
         }
@@ -871,8 +897,10 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor gate_flat = gate.view({kCfg.q_size, T});
     Tensor k_flat    = k.view({kCfg.kv_size, T});
     Tensor v_flat    = v.view({kCfg.kv_size, T});
-    Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
-                                  s);
+    aphase(a_qkv, [&] {
+        Variant::attention_projection(h, *w.projection, q_flat, gate_flat, k_flat, v_flat, ph, work_,
+                                      s);
+    });
 
     const auto results = workspace_recipe::text_attention_results<TextConfig>(work_, T);
     Tensor qn          = results.normalized_query.view({kCfg.head_dim, kCfg.n_q, T});
@@ -889,6 +917,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    aphase(a_fa, [&] {
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -910,9 +939,12 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
                                       batch_text_kv_->batch_layer_view(fidx),
                                       *active_causal_attention_envelope_, work_, a, s);
     }
+    });
     ops::sigmoid_mul(gate, a, s);
 
-    Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    aphase(a_oproj, [&] {
+        Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
+    });
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
@@ -1109,8 +1141,18 @@ void TextContext::run_sparse_moe_graph(const Tensor& hidden, const Payload& payl
     // locally over all 256 experts on each card (deterministic tie-break => identical selection), so
     // no ids/alpha broadcast is needed. WritePartial epilogue seeds primary_partial from zero.
     CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
-    const ops::SparseMoeShard primary_shard{
-        .expert_lo = 0, .expert_hi = 128, .include_shared = true, .add_residual = false};
+    constexpr std::int32_t kMoeExperts = 256;
+    constexpr std::int32_t kGateUpRowsPerExpert = 1024;
+    const std::int32_t primary_expert_hi = payload.op.routed_gate_up.n / kGateUpRowsPerExpert;
+    if (primary_expert_hi <= 0 || primary_expert_hi >= kMoeExperts ||
+        payload.secondary_op.routed_gate_up.n !=
+            (kMoeExperts - primary_expert_hi) * kGateUpRowsPerExpert) {
+        throw std::logic_error("expert-parallel MoE weights have inconsistent expert bands");
+    }
+    const ops::SparseMoeShard primary_shard{.expert_lo = 0,
+                                            .expert_hi = primary_expert_hi,
+                                            .include_shared = true,
+                                            .add_residual = false};
     {
         auto primary_scope = work_.scope();
         const std::size_t primary_bytes = ops::sparse_moe_partial_workspace_capacity_bytes(
@@ -1132,8 +1174,10 @@ void TextContext::run_sparse_moe_graph(const Tensor& hidden, const Payload& payl
         CUDA_CHECK(cudaStreamWaitEvent(secondary_stream, primary_ready, 0));
         CUDA_CHECK(cudaMemcpyAsync(secondary_hidden.data, hidden.data, hidden.bytes(),
                                    cudaMemcpyDefault, secondary_stream));  // broadcast hidden
-        const ops::SparseMoeShard secondary_shard{
-            .expert_lo = 128, .expert_hi = 256, .include_shared = false, .add_residual = false};
+        const ops::SparseMoeShard secondary_shard{.expert_lo = primary_expert_hi,
+                                                  .expert_hi = kMoeExperts,
+                                                  .include_shared = false,
+                                                  .add_residual = false};
         const std::size_t secondary_bytes = ops::sparse_moe_partial_workspace_capacity_bytes(
             payload.secondary_op.routed_gate_up.qtype, payload.secondary_op.routed_down.qtype,
             tokens, tokens);
@@ -1158,11 +1202,43 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
     // GQA group split both rely on an even head count on both.
     static_assert(TextConfig::query_heads % 2 == 0 && TextConfig::kv_heads % 2 == 0,
                   "tensor-parallel attention requires even query and KV head counts");
-    // The tensor-parallel path only handles the split (two-weight, head-splittable) projection form.
-    const auto* split = std::get_if<0>(&payload);
-    if (split == nullptr) {
-        throw std::logic_error("tensor-parallel attention requires a split attention projection");
+    if constexpr (Variant::fused_graph_attention) {
+        if (!payload.head_sharded) {
+            throw std::logic_error("tensor-parallel attention requires a head-sharded projection");
+        }
     }
+    const auto primary_qk = [&]() -> const Weight& {
+        if constexpr (Variant::fused_graph_attention) {
+            return payload.query_key_gate_value;
+        } else {
+            const auto* split = std::get_if<0>(&payload);
+            if (split == nullptr) {
+                throw std::logic_error("tensor-parallel attention requires a split attention projection");
+            }
+            return split->query_key;
+        }
+    };
+    const auto primary_gv = [&]() -> const Weight& {
+        if constexpr (Variant::fused_graph_attention) {
+            return payload.query_key_gate_value;
+        } else {
+            return std::get<0>(payload).gate_value;
+        }
+    };
+    const auto secondary_qk = [&]() -> const Weight& {
+        if constexpr (Variant::fused_graph_attention) {
+            return payload.secondary_query_key_gate_value;
+        } else {
+            return std::get<0>(payload).secondary_query_key;
+        }
+    };
+    const auto secondary_gv = [&]() -> const Weight& {
+        if constexpr (Variant::fused_graph_attention) {
+            return payload.secondary_query_key_gate_value;
+        } else {
+            return std::get<0>(payload).secondary_gate_value;
+        }
+    };
     // Env-gated per-phase timing (NINFER_TP_PROFILE). Each phase syncs its stream so the measured
     // times are serialized wall-clock per phase -- diagnostic only, off by default.
     static const bool tp_prof = std::getenv("NINFER_TP_PROFILE") != nullptr;
@@ -1262,10 +1338,17 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
                                   const Tensor& h_in, const Tensor& qnorm_w, const Tensor& knorm_w,
                                   const Tensor& cache_pos, const Tensor& rope_pos,
                                   const Tensor& kv_rows, const Tensor& valid_cols, Tensor& a_half) {
-        Tensor qk = W.alloc(DType::BF16, {shard_rows, T});
-        Tensor gv = W.alloc(DType::BF16, {shard_rows, T});
-        tp_phase(t_proj, stream,
-                 [&] { ops::attn_input_proj_graph_shard(h_in, qk_w, gv_w, qk, gv, W, stream); });
+        Tensor qk;
+        Tensor gv;
+        if constexpr (Variant::fused_graph_attention) {
+            qk = W.alloc(DType::BF16, {2 * shard_rows, T});
+            tp_phase(t_proj, stream, [&] { ops::linear(h_in, qk_w, qk, stream); });
+        } else {
+            qk = W.alloc(DType::BF16, {shard_rows, T});
+            gv = W.alloc(DType::BF16, {shard_rows, T});
+            tp_phase(t_proj, stream,
+                     [&] { ops::attn_input_proj_graph_shard(h_in, qk_w, gv_w, qk, gv, W, stream); });
+        }
         Tensor q    = W.alloc(DType::BF16, {q_half_rows, T});
         Tensor k    = W.alloc(DType::BF16, {kv_half_rows, T});
         Tensor gate = W.alloc(DType::BF16, {q_half_rows, T});
@@ -1273,8 +1356,13 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
         tp_phase(t_unpack, stream, [&] {
             unpack(q, qk, 0, q_half_rows, stream);
             unpack(k, qk, q_half_rows, kv_half_rows, stream);
-            unpack(gate, gv, 0, q_half_rows, stream);
-            unpack(v, gv, q_half_rows, kv_half_rows, stream);
+            if constexpr (Variant::fused_graph_attention) {
+                unpack(gate, qk, shard_rows, q_half_rows, stream);
+                unpack(v, qk, shard_rows + q_half_rows, kv_half_rows, stream);
+            } else {
+                unpack(gate, gv, 0, q_half_rows, stream);
+                unpack(v, gv, q_half_rows, kv_half_rows, stream);
+            }
         });
         Tensor qn  = W.alloc(DType::BF16, {q_half_rows, T});
         Tensor kn  = W.alloc(DType::BF16, {kv_half_rows, T});
@@ -1318,7 +1406,7 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
 
     // Publish the normalized hidden, then run the primary half so it overlaps the secondary card.
     CUDA_CHECK(cudaEventRecord(primary_ready, primary_stream));
-    compute_half(primary_stream, work_, split->query_key, split->gate_value,
+    compute_half(primary_stream, work_, primary_qk(), primary_gv(),
                  batch_text_kv_->batch_layer_view(fidx), h, *w.q_norm, *w.k_norm, cache_positions,
                  rope_positions, kv_table_rows, valid, a_primary);
     scatter(a_full, a_primary, 0, primary_stream);
@@ -1344,8 +1432,8 @@ void TextContext::attn_mix_graph(const FullLayerW& w, const Payload& payload, Te
         CUDA_CHECK(cudaMemcpyAsync(sec_view.block_tables.data, primary_bt.data, primary_bt.bytes(),
                                    cudaMemcpyDefault, secondary_stream));
         secondary_a = secondary_work_->alloc(DType::BF16, {q_half_rows, T});
-        compute_half(secondary_stream, *secondary_work_, split->secondary_query_key,
-                     split->secondary_gate_value, sec_view, h_d1, qnorm_d1, knorm_d1, cache_d1,
+        compute_half(secondary_stream, *secondary_work_, secondary_qk(), secondary_gv(),
+                     sec_view, h_d1, qnorm_d1, knorm_d1, cache_d1,
                      rope_d1, rows_d1, valid_d1, secondary_a);
         CUDA_CHECK(cudaEventRecord(secondary_ready, secondary_stream));
     }

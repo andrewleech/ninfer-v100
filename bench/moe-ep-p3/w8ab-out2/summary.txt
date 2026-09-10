@@ -1,0 +1,3 @@
+LEG dp4a  [attn-prof] qkv_proj=14.750 fa=41.991 o_proj=1.736 (s)  [decode-prof] fwd=151 attn=58.645 gdn=17.592 mlp=25.285 (s)  last-prefill=1367.7tok/s
+LEG mma  [attn-prof] qkv_proj=15.003 fa=44.366 o_proj=5.018 (s)  [decode-prof] fwd=151 attn=64.555 gdn=27.841 mlp=26.289 (s)  last-prefill=1171.6tok/s
+262144 LOAD OK (arena fits with W8 dp4a scratch)

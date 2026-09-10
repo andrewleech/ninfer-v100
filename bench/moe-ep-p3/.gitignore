@@ -1,5 +1,11 @@
 results/
+compare-out/
 __pycache__/
 *.pyc
 validate-out/
 profile-out*/
+decomp-out/
+flash-out/
+w8ab-out/
+sweep-out/
+real64k-out/

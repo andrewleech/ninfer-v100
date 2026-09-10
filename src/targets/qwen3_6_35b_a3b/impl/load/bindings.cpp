@@ -2,12 +2,15 @@
 
 #include "artifact/typed_binding.h"
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
@@ -20,6 +23,20 @@ bool is_full_layer(std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 
 NumericFormat routed_down_format(std::size_t layer) {
     return layer == 34 || layer == 38 || layer == 39 ? NumericFormat::Q6G64_F16S
                                                      : NumericFormat::Q5G64_F16S;
+}
+
+std::int32_t configured_primary_expert_count() {
+    constexpr std::int32_t kDefault = 128;
+    const char* value = std::getenv("NINFER_MOE_PRIMARY_EXPERTS");
+    if (value == nullptr || *value == '\0') { return kDefault; }
+    std::int32_t count = 0;
+    const auto [end, error] =
+        std::from_chars(value, value + std::char_traits<char>::length(value), count);
+    if (error != std::errc{} || *end != '\0' || count <= 0 || count >= 256) {
+        throw std::invalid_argument(
+            "NINFER_MOE_PRIMARY_EXPERTS must be an integer in [1,255]");
+    }
+    return count;
 }
 
 Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
@@ -58,13 +75,13 @@ MoePlan bind_moe(artifact::Binder& binder, const std::string& prefix, NumericFor
 }
 
 SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtifact& materialized,
-                          NumericFormat routed_gate_up, NumericFormat routed_down) {
-    // Expert-parallel split: when the routed banks were sharded across two cards, rank 0 holds
-    // experts 0-127 (131072 gate_up rows / 262144 down rows) and rank 1 holds experts 128-255. A
-    // single-card (or MTP, never sharded) load keeps the whole 256-expert banks on rank 0.
+                          NumericFormat routed_gate_up, NumericFormat routed_down,
+                          std::int32_t primary_expert_count) {
+    // Expert-parallel split: rank 0 owns the leading configured band and rank 1 owns the remainder.
+    // The row-band materializer compacts both bands. A single-card load keeps all 256 experts on rank 0.
     const bool dual              = materialized.has_device_data(plan.routed_gate_up, 1);
-    const std::int32_t gate_rows = dual ? 131072 : 262144;
-    const std::int32_t down_rows = dual ? 262144 : 524288;
+    const std::int32_t gate_rows = dual ? primary_expert_count * 1024 : 262144;
+    const std::int32_t down_rows = dual ? primary_expert_count * 2048 : 524288;
     SparseMoePayload out;
     out.op = {
         .router_shared_gate = artifact::materialized_weight(materialized, plan.router_shared_gate,
@@ -80,13 +97,15 @@ SparseMoePayload load_moe(const MoePlan& plan, const artifact::MaterializedArtif
     };
     if (dual) {
         out.has_secondary = true;
-        // Rank-1 routed shards (experts 128-255, compacted to local row 0). Router/shared alias the
-        // rank-0 copies; the rank-1 kernels reach them over UVA peer access (small, read-once).
+        // Rank-1's trailing expert band is compacted to local row zero. Router/shared alias rank 0;
+        // rank-1 kernels reach them over UVA peer access (small, read-once).
         out.secondary_op                    = out.op;
         out.secondary_op.routed_gate_up     = artifact::materialized_weight(
-            materialized, plan.routed_gate_up, routed_gate_up, 131072, 2048, /*device_rank=*/1);
+            materialized, plan.routed_gate_up, routed_gate_up,
+            (256 - primary_expert_count) * 1024, 2048, /*device_rank=*/1);
         out.secondary_op.routed_down        = artifact::materialized_weight(
-            materialized, plan.routed_down, routed_down, 262144, 512, /*device_rank=*/1);
+            materialized, plan.routed_down, routed_down,
+            (256 - primary_expert_count) * 2048, 512, /*device_rank=*/1);
     }
     return out;
 }
@@ -112,11 +131,13 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 } // namespace
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
-                               bool graph_parallel) {
+                               bool graph_parallel, bool tp_attention) {
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
     out.frontend        = qwen3_6::bind_frontend_resources(binder);
     out.features        = features;
+    out.primary_expert_count = graph_parallel ? configured_primary_expert_count() : 256;
+    out.tp_attention = graph_parallel && tp_attention;
     out.token_embedding = artifact::bind_device_tensor(binder, "text/token_embedding",
                                                        NumericFormat::W8G32_F16S, {248320, 2048});
 
@@ -159,19 +180,31 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     }
 
     if (graph_parallel) {
-        // Expert-parallel MoE: card 0 gets experts 0-127, card 1 experts 128-255. routed_gate_up
-        // [262144,2048] splits at row 128*1024=131072; routed_down [524288,512] at row 128*2048=
-        // 262144. Router / shared expert / attention / GDN / embeddings / head stay unsharded
+        // Expert-parallel MoE: card 0 gets the leading configured expert band and card 1 the rest.
+        // routed_gate_up has 1024 rows/expert and routed_down has 2048. Router / shared expert /
+        // attention / GDN / embeddings / head stay unsharded
         // (primary-only). The MTP moe has the same geometry and is sharded the same way below (once
         // its plan is bound), so the MTP post-mixer also runs expert-parallel.
-        constexpr std::uint64_t kGateUpExpertSplit = 131072;  // 128 experts * (gate512 + up512)
-        constexpr std::uint64_t kDownExpertSplit   = 262144;  // 128 experts * hidden2048
+        const std::uint64_t gate_up_expert_split =
+            static_cast<std::uint64_t>(out.primary_expert_count) * 1024;
+        const std::uint64_t down_expert_split =
+            static_cast<std::uint64_t>(out.primary_expert_count) * 2048;
         for (const TextLayerPlan& layer : out.text_layers) {
             binder.shard_row_split_across_devices(layer.moe.routed_gate_up,
                                                   artifact::RowSplitShardAxis::RowBand,
-                                                  kGateUpExpertSplit);
+                                                  gate_up_expert_split);
             binder.shard_row_split_across_devices(
-                layer.moe.routed_down, artifact::RowSplitShardAxis::RowBand, kDownExpertSplit);
+                layer.moe.routed_down, artifact::RowSplitShardAxis::RowBand, down_expert_split);
+        }
+        if (out.tp_attention) {
+            for (const TextLayerPlan& layer : out.text_layers) {
+                if (layer.is_full_attention) {
+                    binder.shard_row_split_across_devices(
+                        layer.attention.query_key_gate_value,
+                        artifact::RowSplitShardAxis::QKGateVHeadHalf,
+                        /* Q rows: 16 heads x 256 dimensions. */ 4096);
+                }
+            }
         }
     }
 
@@ -213,13 +246,14 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeature
     out.mtp.moe        = bind_moe(binder, "mtp/layer/moe/", NumericFormat::W8G32_F16S,
                                   NumericFormat::W8G32_F16S, mtp_placement);
     if (graph_parallel && features.mtp()) {
-        // Same 256-expert geometry as the text-layer MoE (W8/W8 codec), sharded 128/128 the same way
-        // so run_sparse_moe_graph can drive the MTP post-mixer expert-parallel too. This also frees
-        // ~experts-128-255 of the MTP banks off the primary (they move to card 1's weights arena).
+        // Same 256-expert geometry as the text-layer MoE (W8/W8), with the same configured split,
+        // so run_sparse_moe_graph can drive the MTP post-mixer expert-parallel too.
         binder.shard_row_split_across_devices(out.mtp.moe.routed_gate_up,
-                                              artifact::RowSplitShardAxis::RowBand, 131072);
+                                              artifact::RowSplitShardAxis::RowBand,
+                                              static_cast<std::uint64_t>(out.primary_expert_count) * 1024);
         binder.shard_row_split_across_devices(out.mtp.moe.routed_down,
-                                              artifact::RowSplitShardAxis::RowBand, 262144);
+                                              artifact::RowSplitShardAxis::RowBand,
+                                              static_cast<std::uint64_t>(out.primary_expert_count) * 2048);
     }
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {2048});
 
@@ -292,9 +326,15 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             FullAttentionWeights& target = full_layers.at(full_index++);
             target.input_norm            = artifact::materialized_tensor(backing, source.input_norm,
                                                                          NumericFormat::BF16, {2048});
-            target.projection.query_key_gate_value =
-                artifact::materialized_weight(backing, source.attention.query_key_gate_value,
-                                              NumericFormat::W8G32_F16S, 9216, 2048);
+            target.projection.head_sharded = plan.tp_attention;
+            target.projection.query_key_gate_value = artifact::materialized_weight(
+                backing, source.attention.query_key_gate_value, NumericFormat::W8G32_F16S,
+                plan.tp_attention ? 4608 : 9216, 2048);
+            if (plan.tp_attention) {
+                target.projection.secondary_query_key_gate_value = artifact::materialized_weight(
+                    backing, source.attention.query_key_gate_value, NumericFormat::W8G32_F16S,
+                    4608, 2048, /*device_rank=*/1);
+            }
             target.query_norm = artifact::materialized_tensor(backing, source.attention.query_norm,
                                                               NumericFormat::BF16, {256});
             target.key_norm   = artifact::materialized_tensor(backing, source.attention.key_norm,
@@ -304,7 +344,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
             target.post_mixer =
-                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer));
+                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer),
+                         plan.primary_expert_count);
         } else {
             GdnWeights& target = gdn_layers.at(gdn_index++);
             target.input_norm  = artifact::materialized_tensor(backing, source.input_norm,
@@ -326,7 +367,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
             target.post_attention_norm = artifact::materialized_tensor(
                 backing, source.post_attention_norm, NumericFormat::BF16, {2048});
             target.post_mixer =
-                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer));
+                load_moe(source.moe, backing, NumericFormat::Q4G64_F16S, routed_down_format(layer),
+                         plan.primary_expert_count);
         }
     }
     if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {
@@ -367,7 +409,8 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {2048});
         mtp.post_mixer =
-            load_moe(plan.mtp.moe, backing, NumericFormat::W8G32_F16S, NumericFormat::W8G32_F16S);
+            load_moe(plan.mtp.moe, backing, NumericFormat::W8G32_F16S, NumericFormat::W8G32_F16S,
+                     plan.primary_expert_count);
         mtp.final_norm = artifact::materialized_tensor(backing, plan.mtp.final_norm,
                                                        NumericFormat::BF16, {2048});
     }

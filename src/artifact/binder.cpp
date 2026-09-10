@@ -141,6 +141,12 @@ void Binder::shard_row_split_across_devices(ObjectHandle handle, RowSplitShardAx
         if (split == 0 || split >= rows || (split % 2) != 0 || ((rows - split) % 2) != 0) {
             throw ArtifactError("qkv-head-half shard split is outside the logical row range");
         }
+    } else if (axis == RowSplitShardAxis::QKGateVHeadHalf) {
+        // split is Q rows. The W8 parent is [Q | K | gate | V], where K/V each have Q/8 rows
+        // for this target. Every head band must divide evenly between the two cards.
+        if (split == 0 || rows != split * 2 + split / 4 || (split % 8) != 0) {
+            throw ArtifactError("fused-qk-gate-v shard geometry is invalid");
+        }
     } else if (axis == RowSplitShardAxis::RowBand) {
         // One contiguous outer-row band. The row-split-k128 grouping runs along the columns and is
         // untouched by an outer-row split, so no column-group check applies.
@@ -232,6 +238,9 @@ MaterializationPlan Binder::finish() {
                     const std::uint64_t kv_total = rows - shard->split;
                     primary_shape   = {q_total / 2 + kv_total / 2, cols};
                     secondary_shape = {(q_total - q_total / 2) + (kv_total - kv_total / 2), cols};
+                } else if (shard->axis == RowSplitShardAxis::QKGateVHeadHalf) {
+                    primary_shape   = {rows / 2, cols};
+                    secondary_shape = {rows / 2, cols};
                 } else if (shard->axis == RowSplitShardAxis::RowBand) {
                     primary_shape   = {shard->split, cols};
                     secondary_shape = {rows - shard->split, cols};

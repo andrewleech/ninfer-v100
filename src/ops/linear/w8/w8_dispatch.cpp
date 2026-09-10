@@ -1,5 +1,6 @@
 #include "ops/linear/w8/w8_dispatch.h"
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -69,6 +70,11 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         case 9216:
             if (t <= 13) { return launch_w8_simt_r8_c4; }
             if (t <= 128) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        case 4608:
+            // One compact 35B tensor-parallel Q/K/gate/V head shard. Volta's generic fallback
+            // below maps wide-T MMA selections to the validated sliced SIMT implementation.
+            if (t <= 16) { return launch_w8_simt_r8_c4; }
             return launch_w8_mma_r64_c128;
         case 12288:
             if (t <= 16) { return launch_w8_simt_r8_c4; }
@@ -246,8 +252,25 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 }
 
 void w8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 cudaStream_t stream) {
-    const W8Launch launch = select_w8_launch(w.n, w.k, x.ne[1], policy);
+                 WorkspaceArena* workspace, cudaStream_t stream) {
+    const std::int32_t t = x.ne[1];
+#ifdef NINFER_VOLTA_BUILD
+    // DP4A quantizes the BF16 activation to int8. It is therefore an A8 implementation and must
+    // never satisfy the A16 contract, even when a workspace is available.
+    static const bool no_dp4a = std::getenv("NINFER_W8_NO_DP4A") != nullptr;
+    if (!no_dp4a && workspace != nullptr && t >= kW8Dp4aMinT &&
+        policy == LinearPolicy::AllowA8 &&
+        w8_volta_dp4a_supported(w.n, w.k, t)) {
+        const std::size_t need = w8_volta_dp4a_workspace_bytes(w.n, w.k, t);
+        if (workspace->capacity() - workspace->used() >= need) {
+            launch_w8_volta_dp4a(x, w, out, *workspace, stream);
+            return;
+        }
+    }
+#else
+    (void)workspace;
+#endif
+    const W8Launch launch = select_w8_launch(w.n, w.k, t, policy);
     launch(x, w, out, stream);
 }
 

@@ -44,6 +44,8 @@ struct Variant {
     static constexpr bool supports_graph_parallel               = true;
     // 27B keeps NVLink tensor-parallel attention and the dense (non-MoE) post_mixer graph path.
     static constexpr bool graph_parallel_attention              = true;
+    static constexpr bool fused_graph_attention                 = false;
+    static bool attention_graph_enabled(const FullAttentionProjectionWeights&) { return true; }
     static constexpr bool graph_parallel_post_mixer_is_moe      = false;
     static constexpr std::size_t graph_primary_attention_layers = 5;
 

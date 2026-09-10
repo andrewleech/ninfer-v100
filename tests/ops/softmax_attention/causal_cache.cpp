@@ -62,6 +62,7 @@ struct Geometry {
 constexpr Geometry kGeometries[] = {
     {"d256-h24-kv4", 24, 4},
     {"d256-h16-kv2", 16, 2},
+    {"d256-h8-kv1", 8, 1},
 };
 
 ops::AttentionHeadGeometry op_geometry(const Geometry& geometry) {
@@ -1529,6 +1530,15 @@ int run_geometry(const Geometry& geometry) {
             failures += run_a3_case(geometry, dtype, test_case, MappingPattern::Identity);
         }
 
+        // The 35B tensor-parallel route runs this exact 8Q/1KV geometry through Volta flash at
+        // the 2,048-token production prefill chunk. Keep a full-width oracle here: the short
+        // 128/129 cases above exercise dispatch, but cannot expose a large-prompt head mapping or
+        // staging error.
+        if (geometry.q_heads == 8 && geometry.kv_heads == 1) {
+            failures += run_a3_case(geometry, dtype, {2048, 0, 2048, 451u},
+                                    MappingPattern::Identity);
+        }
+
         if (geometry.q_heads == 16) {
             // Loose execution envelopes straddle the two registered host-resource frontiers.
             // Device positions, not these bounds, continue to define the oracle result.
@@ -1546,6 +1556,8 @@ int run_geometry(const Geometry& geometry) {
 int run_fp8_cases() {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
+        // The 35B TP 8q/1kv path intentionally has no FP8 cache implementation yet.
+        if (geometry.kv_heads == 1) { continue; }
         failures += run_a1_case(geometry, DType::FP8_E4M3FN, {65, 63, 192, 601u},
                                 MappingPattern::Fragmented);
         failures += run_a3_case(geometry, DType::FP8_E4M3FN, {65, 63, 192, 602u},

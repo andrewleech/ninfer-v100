@@ -28,7 +28,8 @@ void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
           (geometry.query_heads == 16 && geometry.kv_heads == 2) ||
-          (geometry.query_heads == 12 && geometry.kv_heads == 2))) {
+          (geometry.query_heads == 12 && geometry.kv_heads == 2) ||
+          (geometry.query_heads == 8 && geometry.kv_heads == 1))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
 }
@@ -264,7 +265,8 @@ bool volta_flash_route_possible(std::int32_t q_heads, std::int32_t width,
     // fast path; the 12-head prefill was otherwise ~7x slower on the standard prompt path.
     const bool supported_geometry = q_heads == CausalD256H24Kv4::QHeads ||
                                     q_heads == CausalD256H16Kv2::QHeads ||
-                                    q_heads == CausalD256H12Kv2::QHeads;
+                                    q_heads == CausalD256H12Kv2::QHeads ||
+                                    q_heads == CausalD256H8Kv1::QHeads;
     return supported_geometry && batch_size == 1 &&
            (cache_dtype == DType::BF16 || cache_dtype == DType::I8) &&
            width >= detail::kVoltaFlashMinimumWidth;
@@ -286,7 +288,9 @@ VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace,
                                                    CausalAttentionExecutionEnvelope envelope) {
     const std::int32_t kv_heads = q_heads == CausalD256H24Kv4::QHeads
                                       ? CausalD256H24Kv4::KVHeads
-                                      : CausalD256H16Kv2::KVHeads;
+                                      : q_heads == CausalD256H8Kv1::QHeads
+                                            ? CausalD256H8Kv1::KVHeads
+                                            : CausalD256H16Kv2::KVHeads;
     const auto visible          = static_cast<std::int32_t>(envelope.max_visible_keys);
     const std::int32_t n_kv =
         ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
@@ -547,6 +551,14 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], q.ne[2], 1, envelope);
 #ifdef NINFER_VOLTA_BUILD
+    // The public workspace query is shared with the append-and-attend overload. At prompt widths
+    // that overload uses Volta flash staging, whereas this cached-only overload still uses the
+    // native paged prompt kernel because it has no newly projected K/V to feed the flash launcher.
+    // Reserve the same staging layout so both overloads honour the advertised capacity contract.
+    if (route == detail::CausalAttentionRoute::Prompt &&
+        volta_flash_route_possible(q.ne[1], q.ne[2], 1, cache.dtype)) {
+        (void)allocate_volta_flash_workspace(workspace, q.ne[1], q.ne[2], envelope);
+    }
     if (cache.dtype == DType::FP8_E4M3FN) {
         detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out, stream);
         return;

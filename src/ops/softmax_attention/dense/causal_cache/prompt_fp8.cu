@@ -1,6 +1,8 @@
 // ninfer::ops::detail - row-scaled E4M3FN-cache causal prompt launch ownership.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
+#include <stdexcept>
+
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
@@ -64,6 +66,9 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
         causal_attention_prompt_fp8_attention_launch_for<CausalD256H24Kv4>(
             q, positions, scale, cache, metadata, out, stream);
         return;
+    }
+    if (q.ne[1] == CausalD256H8Kv1::QHeads) {
+        throw std::invalid_argument("FP8 causal prompt attention does not support 8q/1kv");
     }
     causal_attention_prompt_fp8_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
                                                                        metadata, out, stream);

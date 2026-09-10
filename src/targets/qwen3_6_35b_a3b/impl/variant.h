@@ -40,7 +40,11 @@ struct Variant {
     // residual (run_sparse_moe_graph). Attention/GDN stay single-card (replicated on the primary) in
     // P1, so graph_parallel_attention=false. See docs/DUAL-V100-PORT-PLAN.md.
     static constexpr bool supports_graph_parallel               = true;
-    static constexpr bool graph_parallel_attention              = false;
+    static constexpr bool graph_parallel_attention              = true;
+    static constexpr bool fused_graph_attention                 = true;
+    static bool attention_graph_enabled(const FullAttentionProjectionWeights& weights) {
+        return weights.head_sharded;
+    }
     static constexpr bool graph_parallel_post_mixer_is_moe      = true;
     static constexpr std::size_t graph_primary_attention_layers = 0;
 

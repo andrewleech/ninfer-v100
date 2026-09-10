@@ -35,6 +35,9 @@ enum class RowSplitShardAxis : std::uint8_t {
     // remainder) each halved by head across the two cards, giving equal [rows/2, cols] shards. `split`
     // is the Q-band boundary (q_size), not a tunable point -- the head split is always 50/50.
     QkvHeadHalf,
+    // Fused Q/K/gate/V attention projection. The four physical row bands are split by head and
+    // compacted as [Q half | K half | gate half | V half] on each card.
+    QKGateVHeadHalf,
     // Expert-parallel MoE: one contiguous outer-row band. Primary owns rows [0, split); secondary owns
     // rows [split, rows). All columns kept; every plane (low/high/scale) partitions by row, so an
     // expert-index split == a plain row-band split (routed_gate_up @131072, routed_down @262144).

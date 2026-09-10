@@ -7,6 +7,7 @@
 #include "targets/qwen3_6_35b_a3b/impl/variant.h"
 
 #include <stdexcept>
+#include <cstdlib>
 #include <utility>
 
 namespace ninfer::targets::qwen3_6_35b_a3b::detail {
@@ -76,9 +77,11 @@ Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptio
                                      WeightsProfile weights_profile) {
     // Dual-device launch => expert-parallel MoE (experts split 128/128 across the two cards).
     const bool graph_parallel = options.devices.size() == 2;
+    const bool tp_attention = graph_parallel && std::getenv("NINFER_TP_ATTENTION") != nullptr;
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
-        detail::bind_artifact(binder, qwen3_6::startup_features(options), graph_parallel)));
+        detail::bind_artifact(binder, qwen3_6::startup_features(options), graph_parallel,
+                              tp_attention)));
 }
 
 std::unique_ptr<Package::LoadedModel>

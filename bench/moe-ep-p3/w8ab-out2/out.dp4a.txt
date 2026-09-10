@@ -1,0 +1,5 @@
+The text provided is a repetition of the same paragraph 47 times (indexed [0] through [46]).
+
+Here is the single, unique description contained within those repetitions:
+
+**On a Volta V100, the mixture-of-experts router selects a small subset of expert feed-forward networks for each

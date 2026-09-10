@@ -166,6 +166,9 @@ void copy_row_split_shard_from_host(const Reader& reader,
         const std::uint64_t kv_total = tensor->shape[0] - shard.split;
         primary_shape   = {q_total / 2 + kv_total / 2, tensor->shape[1]};
         secondary_shape = {(q_total - q_total / 2) + (kv_total - kv_total / 2), tensor->shape[1]};
+    } else if (shard.axis == RowSplitShardAxis::QKGateVHeadHalf) {
+        primary_shape = {tensor->shape[0] / 2, tensor->shape[1]};
+        secondary_shape = primary_shape;
     } else if (shard.axis == RowSplitShardAxis::RowBand) {
         primary_shape   = {shard.split, tensor->shape[1]};
         secondary_shape = {tensor->shape[0] - shard.split, tensor->shape[1]};
@@ -219,6 +222,23 @@ void copy_row_split_shard_from_host(const Reader& reader,
                                    q_half, 0, sec_q, g, stream, copied_bytes);
         copy_row_split_region_host(secondary, secondary_geometry, sec_q, source, source_geometry,
                                    q_total + kv_half, 0, sec_kv, g, stream, copied_bytes);
+        return;
+    }
+    if (shard.axis == RowSplitShardAxis::QKGateVHeadHalf) {
+        const std::uint64_t g = source_geometry.groups_per_row;
+        const std::uint64_t q = shard.split;
+        const std::uint64_t kv = q / 8;
+        const std::array<std::uint64_t, 4> starts{0, q, q + kv, 2 * q + kv};
+        const std::array<std::uint64_t, 4> rows{q, kv, q, kv};
+        std::uint64_t dst = 0;
+        for (std::size_t band = 0; band < starts.size(); ++band) {
+            const std::uint64_t half = rows[band] / 2;
+            copy_row_split_region_host(primary, primary_geometry, dst, source, source_geometry,
+                                       starts[band], 0, half, g, stream, copied_bytes);
+            copy_row_split_region_host(secondary, secondary_geometry, dst, source, source_geometry,
+                                       starts[band] + half, 0, half, g, stream, copied_bytes);
+            dst += half;
+        }
         return;
     }
     if (shard.axis == RowSplitShardAxis::RowBand) {

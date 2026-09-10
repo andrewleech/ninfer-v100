@@ -297,6 +297,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear/q5/q5_volta_dp4a_gemm.cu
     ops/linear/w8/w8_volta_mma_gemm.cu
     ops/linear/w8/w8_volta_qpn_gemm.cu
+    ops/linear/w8/w8_volta_dp4a_gemm.cu
     ops/linear_add/q5/q5_linear_add_cutlass_sm70.cu
     ops/linear_add/bf16/bf16_linear_add_volta.cu
     ops/linear_swiglu/fp8/fp8_linear_swiglu_volta_qpn.cu

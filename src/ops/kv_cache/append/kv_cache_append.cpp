@@ -182,7 +182,7 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
         throw std::invalid_argument("kv_cache_append: positions must be I32");
     }
     const std::int32_t kv_heads = k.ne[1];
-    if (kv_heads != 4 && kv_heads != 2) {
+    if (kv_heads != 4 && kv_heads != 2 && kv_heads != 1) {
         throw std::invalid_argument("kv_cache_append: unsupported KV head geometry");
     }
     const std::int32_t tokens = k.ne[2];

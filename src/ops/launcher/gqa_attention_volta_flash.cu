@@ -31,6 +31,10 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -80,6 +84,12 @@ template <>
 struct VoltaFlashTiling<CausalD256H12Kv2> {
     static constexpr int ncols2 = 2;
     static constexpr int ncols1 = 16;
+};
+
+template <>
+struct VoltaFlashTiling<CausalD256H8Kv1> {
+    static constexpr int ncols2 = 8;
+    static constexpr int ncols1 = 4;
 };
 
 template <typename Geometry>
@@ -389,6 +399,13 @@ const FlashLaunchConfig& flash_launch_config() {
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &c.blocks_per_sm, reinterpret_cast<const void *>(kernel), c.nthreads, c.nbytes_shared);
         if (c.blocks_per_sm <= 0) { c.blocks_per_sm = 1; }
+        if (std::getenv("NINFER_FLASH_PROFILE") != nullptr) {
+            std::fprintf(stderr,
+                "[flash-cfg] ncols1=%d ncols2=%d nthreads=%d nbatch_fa=%d smem=%zuB "
+                "blocks_per_sm=%d nsm=%d\n",
+                P::kNcols1, P::kNcols2, c.nthreads, c.nbatch_fa, c.nbytes_shared,
+                c.blocks_per_sm, c.nsm);
+        }
         return c;
     }();
     return config;
@@ -483,6 +500,28 @@ std::size_t meta_elements_impl(std::int32_t tokens) {
     return static_cast<std::size_t>(nblocks) * P::kNcols * (2 + kDV / 2);
 }
 
+// Env-gated flash-vs-staging split (NINFER_FLASH_PROFILE): stream-synced wall-clock for the
+// append+gather+mask+convert STAGING vs the flash_attn_ext KERNEL launches, to locate the deficit
+// inside run_layers' fa bucket. The syncs perturb absolute time; the split is the signal. Printed
+// once at exit.
+struct FlashProf {
+    std::atomic<double> stage{0.0}, flash{0.0};
+    ~FlashProf() {
+        if (stage.load() + flash.load() > 0.0) {
+            std::fprintf(stderr, "[flash-prof] staging=%.3f flash_kernel=%.3f (s)\n",
+                         stage.load(), flash.load());
+        }
+    }
+};
+inline FlashProf& flash_prof() { static FlashProf p; return p; }
+inline bool flash_prof_on() {
+    static const bool on = std::getenv("NINFER_FLASH_PROFILE") != nullptr;
+    return on;
+}
+inline double steady_now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 template <typename Geometry>
 void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                              const Tensor& positions, const Tensor& table_rows, float scale,
@@ -490,6 +529,15 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                              std::int32_t q_block_tokens, Tensor& k_gathered, Tensor& v_gathered,
                              Tensor& mask, Tensor& q_f32, Tensor& out_f32, Tensor& dst_meta,
                              Tensor& out, cudaStream_t stream) {
+    const bool fprof = flash_prof_on();
+    auto tmark = [&]() -> double {
+        if (!fprof) { return 0.0; }
+        cudaStreamSynchronize(stream);
+        return steady_now_s();
+    };
+    auto add_stage = [&](double d) { auto& a = flash_prof().stage; a.store(a.load() + d); };
+    auto add_flash = [&](double d) { auto& a = flash_prof().flash; a.store(a.load() + d); };
+    const double t_begin = tmark();  // staging starts (append + gather below)
     using P                          = VoltaFlashParams<Geometry>;
     constexpr int kQHeads            = P::kQHeads;
     constexpr int kKVHeads           = P::kKVHeads;
@@ -544,6 +592,8 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 
     // 3. Q-blocks. Bounding the block bounds mask memory, and lets earlier blocks
     //    attend over a shorter key range than later ones.
+    double t_prev = tmark();
+    if (fprof) { add_stage(t_prev - t_begin); }  // append + gather
     const std::int32_t base = n_kv_total - width;
     for (std::int32_t begin = 0; begin < width; begin += q_block_tokens) {
         const std::int32_t tokens = std::min(q_block_tokens, width - begin);
@@ -576,6 +626,9 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
 
         cudaMemsetAsync(out_f32.data, 0, static_cast<std::size_t>(q_count) * sizeof(float), stream);
 
+        const double t_pre_flash = tmark();
+        if (fprof) { add_stage(t_pre_flash - t_prev); }  // convert_q + build_mask + memset
+
         launch_flash_block<Geometry>(static_cast<const float*>(q_f32.data),
                            static_cast<const half*>(k_gathered.data),
                            static_cast<const half*>(v_gathered.data),
@@ -583,11 +636,17 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
                            static_cast<float*>(out_f32.data),
                            static_cast<float2*>(dst_meta.data), tokens, n_kv, n_kv, scale, stream);
 
+        const double t_post_flash = tmark();
+        if (fprof) { add_flash(t_post_flash - t_pre_flash); }  // the flash_attn_ext kernel(s)
+
         volta_flash_convert_out_kernel<<<convert_blocks, kConvertThreads, 0, stream>>>(
             static_cast<const float*>(out_f32.data),
             static_cast<__nv_bfloat16*>(out.data) +
                 static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
             q_count);
+
+        t_prev = tmark();
+        if (fprof) { add_stage(t_prev - t_post_flash); }  // convert_out
     }
 }
 
@@ -599,6 +658,7 @@ std::size_t causal_attention_volta_flash_meta_elements(std::int32_t q_heads, std
     if (q_heads == CausalD256H24Kv4::QHeads) { return meta_elements_impl<CausalD256H24Kv4>(tokens); }
     if (q_heads == CausalD256H16Kv2::QHeads) { return meta_elements_impl<CausalD256H16Kv2>(tokens); }
     if (q_heads == CausalD256H12Kv2::QHeads) { return meta_elements_impl<CausalD256H12Kv2>(tokens); }
+    if (q_heads == CausalD256H8Kv1::QHeads) { return meta_elements_impl<CausalD256H8Kv1>(tokens); }
     throw std::invalid_argument("gqa_attention volta flash: unsupported Q head geometry");
 }
 
@@ -625,6 +685,12 @@ void causal_attention_volta_flash_launch(const Tensor& q, const Tensor& k, const
         volta_flash_launch_impl<CausalD256H12Kv2>(q, k, v, positions, table_rows, scale, cache,
                                                envelope, q_block_tokens, k_gathered, v_gathered,
                                                mask, q_f32, out_f32, dst_meta, out, stream);
+        return;
+    }
+    if (q.ne[1] == CausalD256H8Kv1::QHeads) {
+        volta_flash_launch_impl<CausalD256H8Kv1>(q, k, v, positions, table_rows, scale, cache,
+                                                   envelope, q_block_tokens, k_gathered, v_gathered,
+                                                   mask, q_f32, out_f32, dst_meta, out, stream);
         return;
     }
     throw std::invalid_argument("gqa_attention volta flash: unsupported Q head geometry");

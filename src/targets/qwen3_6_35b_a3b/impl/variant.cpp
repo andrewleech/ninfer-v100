@@ -127,8 +127,11 @@ std::vector<GraphExecutionProfile> Variant::dflash_graph_profiles(std::uint32_t 
 void Variant::attention_projection(const Tensor& hidden,
                                    const FullAttentionProjectionWeights& weights, Tensor& query,
                                    Tensor& gate, Tensor& key, Tensor& value, qwen3_6::TextPhase,
-                                   WorkspaceArena&, cudaStream_t stream) {
-    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
+                                   WorkspaceArena& workspace, cudaStream_t stream) {
+    // Keep the policy-bearing A16 call explicit: this fused projection must preserve BF16
+    // activations, and its operator currently needs no transient workspace.
+    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value,
+                         ops::LinearPolicy::A16Only, workspace, stream);
 }
 
 void Variant::attention_output_projection(const Tensor& attention, const Weight& weight,

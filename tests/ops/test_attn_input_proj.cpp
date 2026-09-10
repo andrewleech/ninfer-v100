@@ -1,4 +1,5 @@
 #include "ninfer/ops/attn_input_proj.h"
+#include "ninfer/ops/linear.h"
 
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
@@ -6,7 +7,9 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <span>
 #include <string>
@@ -452,6 +455,99 @@ int run_w8_target() {
     return failures;
 }
 
+quantized_weight::PackedWeight compact_w8_head_half(
+    const quantized_weight::PackedWeight& parent) {
+    constexpr std::int32_t kHidden = 2048;
+    constexpr std::array<std::int32_t, 4> kStarts{0, 4096, 4608, 8704};
+    constexpr std::array<std::int32_t, 4> kRows{4096, 512, 4096, 512};
+    if (parent.weight.qtype != QType::W8G32_F16S || parent.weight.n != 9216 ||
+        parent.weight.k != kHidden) {
+        throw std::invalid_argument("compact W8 fixture has the wrong parent geometry");
+    }
+    quantized_weight::PackedWeight compact = parent;
+    constexpr std::int32_t kShardRows      = 4608;
+    constexpr std::size_t kCodeRow         = kHidden;
+    constexpr std::size_t kScaleRow        = (kHidden / 32) * sizeof(std::uint16_t);
+    compact.code_plane_bytes                = static_cast<std::uint64_t>(kShardRows) * kCodeRow;
+    compact.scale_plane_offset              = compact.code_plane_bytes;
+    compact.scale_plane_bytes               = static_cast<std::uint64_t>(kShardRows) * kScaleRow;
+    compact.payload.assign(static_cast<std::size_t>(compact.scale_plane_offset +
+                                                    compact.scale_plane_bytes), 0);
+    std::size_t destination_row = 0;
+    for (std::size_t band = 0; band < kStarts.size(); ++band) {
+        const std::size_t rows = static_cast<std::size_t>(kRows[band] / 2);
+        const std::size_t source_row = static_cast<std::size_t>(kStarts[band]);
+        std::memcpy(compact.payload.data() + destination_row * kCodeRow,
+                    parent.payload.data() + source_row * kCodeRow, rows * kCodeRow);
+        std::memcpy(compact.payload.data() + compact.scale_plane_offset + destination_row * kScaleRow,
+                    parent.payload.data() + parent.scale_plane_offset + source_row * kScaleRow,
+                    rows * kScaleRow);
+        destination_row += rows;
+    }
+    compact.weight.n               = kShardRows;
+    compact.weight.shape[0]        = kShardRows;
+    compact.weight.padded_shape[0] = kShardRows;
+    compact.weight.payload_bytes   = compact.payload.size();
+    return compact;
+}
+
+int run_w8_compact_equivalence_case(DevicePackedWeight& parent, std::int32_t tokens) {
+    constexpr std::int32_t kHidden = 2048;
+    constexpr std::int32_t kQRows = 4096;
+    constexpr std::int32_t kKvRows = 512;
+    constexpr std::int32_t kHalfQ = kQRows / 2;
+    constexpr std::int32_t kHalfKv = kKvRows / 2;
+    DevicePackedWeight compact(compact_w8_head_half(parent.host));
+    const auto activation = make_bf16_activation(kHidden, tokens, 911U + tokens);
+    const auto activation_bits = bf16_bits(activation);
+    DeviceBuffer device_activation = to_device(activation_bits);
+    GuardedBf16Tensor q(kQRows, tokens), gate(kQRows, tokens), k(kKvRows, tokens), v(kKvRows, tokens);
+    GuardedBf16Tensor shard(2 * kHalfQ + 2 * kHalfKv, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor q_out = q.tensor(), g_out = gate.tensor(), k_out = k.tensor(), v_out = v.tensor();
+    Tensor shard_out = shard.tensor();
+    ops::attn_input_proj(x, parent.view(), q_out, g_out, k_out, v_out, nullptr);
+    ops::linear(x, compact.view(), shard_out, nullptr);
+    cuda_synchronize();
+    const auto packed = shard.values();
+    const auto q_values = q.values(); const auto k_values = k.values();
+    const auto gate_values = gate.values(); const auto v_values = v.values();
+    std::vector<double> actual, expected;
+    actual.reserve(static_cast<std::size_t>(tokens) * 4608);
+    expected.reserve(actual.capacity());
+    for (std::int32_t col = 0; col < tokens; ++col) {
+        const std::size_t shard_base = static_cast<std::size_t>(col) * 4608;
+        const std::size_t q_base = static_cast<std::size_t>(col) * kQRows;
+        const std::size_t kv_base = static_cast<std::size_t>(col) * kKvRows;
+        actual.insert(actual.end(), packed.begin() + shard_base, packed.begin() + shard_base + 4608);
+        expected.insert(expected.end(), q_values.begin() + q_base, q_values.begin() + q_base + kHalfQ);
+        expected.insert(expected.end(), k_values.begin() + kv_base, k_values.begin() + kv_base + kHalfKv);
+        expected.insert(expected.end(), gate_values.begin() + q_base, gate_values.begin() + q_base + kHalfQ);
+        expected.insert(expected.end(), v_values.begin() + kv_base, v_values.begin() + kv_base + kHalfKv);
+    }
+    std::size_t bitwise_mismatches = 0;
+    double max_abs_delta = 0.0;
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        if (actual[index] != expected[index]) { ++bitwise_mismatches; }
+        max_abs_delta = std::max(max_abs_delta, std::abs(actual[index] - expected[index]));
+    }
+    std::cout << "W8 compact fused-parent T=" << tokens << ": bitwise_mismatches="
+              << bitwise_mismatches << '/' << actual.size() << " max_abs_delta=" << max_abs_delta
+              << '\n';
+    return compare("W8 compact fused-parent equivalence T=" + std::to_string(tokens), actual,
+                   expected, kAttnInputProjA16Tolerance);
+}
+
+int run_w8_compact_equivalence() {
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(QType::W8G32_F16S, 9216, 2048, 907U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 17, 2048}) {
+        failures += run_w8_compact_equivalence_case(parent, tokens);
+    }
+    return failures;
+}
+
 int run_w8_companion_case(DevicePackedWeight& parent, std::int32_t tokens) {
     constexpr std::int32_t kHidden      = 2048;
     constexpr std::int32_t kQRows       = 4096;
@@ -509,6 +605,7 @@ int main() {
     failures += run_nvfp4_target();
     failures += run_fp8_target();
     failures += run_w8_target();
+    failures += run_w8_compact_equivalence();
     failures += run_w8_companion();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " attn_input_proj\n";
     return failures == 0 ? 0 : 1;
