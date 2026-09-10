@@ -27,6 +27,14 @@ Performance is reported separately for the RTX 5090 and Tesla V100. [Performance
 records the RTX 5090 benchmark profiles and methodology; [V100 qualification](docs/v100.md) records
 the Volta methodology, complete artifact sweep, and DFlash window sweep.
 
+### Dual V100 NVLink: Qwen3.8-27B at 262K
+
+The `groupwise-int` Qwen3.8-27B artifact runs across two 16 GB V100-SXM2 cards with int8 KV and
+MTP3 at the full 262,144-token context. Against a matched-weight llama.cpp Q4 MTP configuration,
+ninfer is **18–19% faster at 58K–118K decode depth**, while retaining int8 KV where llama requires
+5-bit KV to fit MTP at 262K. The complete fair-comparison methodology, quality check, prefill and
+decode tables, commands, and committed raw results are in [the dual-V100 benchmark chapter](docs/PREFILL-BENCHMARK.md).
+
 ### Tesla V100: software NVFP4 and groupwise inference
 
 The Qwen3.8-27B NVFP4 short-context MTP5 target round is **60.16 ms** with 5.0 licensed tokens,
